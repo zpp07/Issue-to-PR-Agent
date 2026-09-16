@@ -11,10 +11,6 @@
     python coder_reviewer.py   # 从 multi-agent 目录运行
 """
 import os
-import sys
-
-# 把 agent项目 根目录加入 sys.path，以便 import core
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.client import make_client
 from core.agent import run_agent
@@ -100,7 +96,7 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
             return True, issues, round_num, usage
 
         if verbose:
-            print(f"[编排] 未通过，把意见喂回 Coder 继续改...")
+            print("[编排] 未通过，把意见喂回 Coder 继续改...")
         issue_text = "\n".join(f"- {i}" for i in issues)
         coder_task = (
             f"你上次的修改被审查员指出了以下问题：\n{issue_text}\n\n"

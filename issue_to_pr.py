@@ -1,13 +1,10 @@
 """Application adapter that joins planner, Coder/Reviewer, and Phase-2 workflow."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import subprocess
 import sys
 from typing import Any
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.agent import run_agent
 from core.policy import CommandPolicy
@@ -42,10 +39,11 @@ def _validate_plan(plan: Any) -> dict[str, Any]:
 
 
 class IssueToPRService:
-    def __init__(self, workflow: IssueToPRWorkflow, client, model: str = "deepseek-chat"):
+    def __init__(self, workflow: IssueToPRWorkflow, client, model: str = "deepseek-chat", sandbox=None):
         self.workflow = workflow
         self.client = client
         self.model = model
+        self.sandbox = sandbox
 
     def create_and_plan(self, repo_path: str | Path, issue: str) -> tuple[TaskContext, dict[str, Any], str]:
         context = self.workflow.create_task(repo_path, issue)
@@ -73,7 +71,8 @@ class IssueToPRService:
         target = (workspace / target_file).resolve()
         if workspace not in target.parents or not target.is_file():
             raise ValueError("target_file 必须是任务工作区内的现有文件")
-        executor = self.workflow.executor_for(task_id)
+        command_runner = self.sandbox.command_runner(workspace) if self.sandbox else None
+        executor = self.workflow.executor_for(task_id, target.parent, command_runner=command_runner)
         passed, issues, rounds, usage = multi_agent_review(
             self.client, str(target), task=task["issue"], max_rounds=max_rounds,
             model=self.model, verbose=False, executor=executor,
@@ -88,14 +87,20 @@ class IssueToPRService:
         sibling_test = target.parent / f"test_{target.stem}.py"
         conventional_test = workspace / "tests" / f"test_{target.stem}.py"
         target_test = sibling_test if sibling_test.is_file() else conventional_test
-        test_argv = [sys.executable, "-m", "pytest", str(target_test.relative_to(workspace)), "-q"] \
-            if target_test.is_file() else [sys.executable, "-m", "pytest", "-q"]
-        test = subprocess.run(
-            test_argv, cwd=workspace, timeout=60,
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
-        test_report = (test.stdout + test.stderr) or "(无测试输出)"
+        python_executable = "python" if self.sandbox else sys.executable
+        test_argv = [python_executable, "-m", "pytest", str(target_test.relative_to(workspace)), "-q"] \
+            if target_test.is_file() else [python_executable, "-m", "pytest", "-q"]
+        if self.sandbox:
+            test_result = self.sandbox.run(workspace, test_argv, workdir=workspace, timeout=60)
+            test_code, test_report = test_result.exit_code, test_result.output
+        else:
+            test = subprocess.run(
+                test_argv, cwd=workspace, timeout=60,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            test_code = test.returncode
+            test_report = (test.stdout + test.stderr) or "(无测试输出)"
         review = {"passed": passed, "issues": issues, "rounds": rounds,
-                  "tokens": usage.total_tokens, "tests_exit_code": test.returncode,
+                  "tokens": usage.total_tokens, "tests_exit_code": test_code,
                   "test_argv": test_argv}
         return self.workflow.record_execution(task_id, test_report, review)

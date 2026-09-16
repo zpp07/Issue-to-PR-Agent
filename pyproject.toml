@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-issue-to-pr-agent"
+version = "0.2.0"
+description = "A trustworthy, locally operated Issue-to-PR agent prototype"
+requires-python = ">=3.10"
+dependencies = [
+  "openai>=1.0",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
+rag = ["sentence-transformers>=3.0", "numpy>=1.26"]
+
+[tool.setuptools]
+py-modules = ["coder_reviewer", "issue_to_pr", "service_api", "service_http"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "benchmark*"]
+exclude = ["tests*", "eval*"]

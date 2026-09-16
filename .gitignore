@@ -1,8 +1,13 @@
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
 .venv/
 venv/
+.local/
 
 # 环境变量与密钥（绝对不能上传！）
 .env
@@ -17,9 +22,3 @@ eval/cases/
 eval/results.jsonl
 eval/experiment_results.jsonl
 syntax_result.txt
-
-# Legacy local helpers with hard-coded machine paths (not project entry points)
-bug.md
-check_syntax.py
-run.sh
-run_normal.sh

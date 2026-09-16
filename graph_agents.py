@@ -15,10 +15,7 @@ LangGraph 版多 Agent 编排 —— Coder + Reviewer
 裸 dict 子类不会被识别（字段无法在节点间合并）。
 """
 import os
-import sys
 from typing import TypedDict
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver

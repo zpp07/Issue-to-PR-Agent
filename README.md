@@ -1,6 +1,8 @@
-# 多 Agent 代码审查团队（core 改造版）
+# Local Issue-to-PR Agent
 
-把 `multi_agent.py` 的「Coder + Reviewer 编排循环」升级成**可评估、可观测的实验平台**。
+从 Coder + Reviewer demo 演化而来的**可审批、可审计、容器隔离、可评测**的本地
+Issue-to-PR Agent。仓库已自包含 `core/`、服务入口、测试、Docker 与 benchmark；clone 后
+不依赖父目录代码。
 
 ## 核心目标
 
@@ -9,6 +11,20 @@
 1. **这个 agent 真的修好了吗？** → pytest 独立验证，不信任 agent 自说自话
 2. **它花了多少资源？** → token / 成本的全程统计
 3. **它有没有作弊 / 沙箱逃逸？** → 篡改测试检测 + 源文件污染检测
+
+## 快速开始
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+Copy-Item .env.example .env
+python -m pytest
+```
+
+运行真实模型任务前，在本地 `.env` 中填写 `DEEPSEEK_API_KEY`；该文件已被 Git 忽略。
+只运行测试和查看 benchmark 结果不需要 API key。Docker 隔离运行还需要启动 Docker
+Desktop，并按 Phase 3 小节构建 runner 镜像。
 
 ## Phase 2：本地 Issue-to-PR 工作流
 
@@ -24,9 +40,9 @@ Issue → 结构化计划 → 计划审批 → 独立 Git worktree → 修复/�
 - `core/audit.py`：SQLite 的 task、artifact、approval 与 append-only 审计事件。
 - `core/workflow.py`：计划与 diff 审批绑定精确 SHA-256，避免审批对象在执行后漂移。
 - `issue_to_pr.py`：把 Planner 和 Coder/Reviewer 接入状态机。
-- 根目录 `service_api.py`：可选 FastAPI 接口；安装 `pip install -e '.[web]'` 后运行
+- `service_api.py`：可选 FastAPI 接口；安装 `pip install -e '.[web]'` 后运行
   `uvicorn service_api:app --reload`。
-- 若开发机尚未安装第三方依赖，可直接运行根目录 `python service_http.py`；它只用
+- 若开发机尚未安装第三方依赖，可直接运行 `python service_http.py`；它只用
   Python 标准库提供同一组本地 REST 端点，`core/client.py` 也会在缺少 OpenAI SDK 时
   降级为 OpenAI-compatible HTTP 调用。
 
@@ -37,10 +53,64 @@ Docker 无网络运行环境属于下一阶段。
 文件的仓库。先把测试和源代码提交到一个基线 commit，再创建 Issue-to-PR 任务；不要
 把主工作树中临时的未跟踪测试悄悄复制进任务环境。
 
+## Phase 3：Docker 隔离与 hidden-test benchmark
+
+`benchmark/` 提供 22 个确定性 Python 修复任务，以及 `single`、`reviewer`、
+`planner` 三种无检索基线。每个任务运行时物化为两个互不包含的目录：Agent 只看到
+`workspace/` 中的源码和公开测试，独立 verifier 才能只读挂载 `hidden_tests/`。
+
+所有仓库命令通过 `core.sandbox.DockerSandbox` 在临时容器执行，参数固定包含：无网络、
+非 root、只读容器根、capabilities 全移除、`no-new-privileges`、CPU/内存/PID/超时限制。
+宿主 key 不会被传入容器。Docker 不存在时 runner 直接失败，不回退到宿主执行。
+
+```powershell
+docker build -t issue-to-pr-runner:phase3 -f docker\Dockerfile .
+
+# Docker Hub / PyPI 直连不稳定时可覆盖为国内镜像；默认值仍是官方源
+docker build -t issue-to-pr-runner:phase3 `
+  --build-arg BASE_IMAGE=m.daocloud.io/docker.io/library/python:3.11-slim `
+  --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple `
+  -f docker\Dockerfile .
+
+python -m benchmark.run --cases case01_add,case02_grade --methods single,reviewer,planner
+python -m benchmark.run --cases all --methods single,reviewer,planner --workers 3
+# 中断后跳过已有 case/method 键继续执行
+python -m benchmark.run --cases all --methods single,reviewer,planner --workers 3 --resume
+```
+
+结果写入 append-only JSONL，并生成包含成功率、token、成本、耗时、测试篡改、超时和失败
+明细的 Markdown dashboard。benchmark 的 `write_file` 仅允许修改 `buggy.py`；公开测试即使
+被模型尝试改写也会被拒绝，独立 verifier 还会恢复可信副本后再挂载 hidden tests。
+
+### 实测结果（2026-09-16，deepseek-chat）
+
+| 方法 | Hidden pass | 平均 tokens | 平均成本 | 平均耗时 | 测试改写 |
+|---|---:|---:|---:|---:|---:|
+| single | 22/22 (100%) | 3,586 | ¥0.0095 | 27.21s | 0 |
+| reviewer | 21/22 (95.5%) | 9,725 | ¥0.0264 | 60.22s | 0 |
+| planner | 21/22 (95.5%) | 11,271 | ¥0.0321 | 67.70s | 0 |
+
+66 个唯一任务组合共花费 ¥1.4955，容器超时为 0。失败的 reviewer/case22 和
+planner/case12 都出现「Agent 自评通过，但 hidden verifier 失败」。当前结论不是多 Agent
+更强，而是这 22 个函数级任务对 single 过于简单；reviewer/planner 增加了 2.7–3.4 倍
+token 成本，成功率反而略低。下一轮应在跨文件、需要检索和复杂契约的子集上做消融。
+
+这是单次运行的工程基线，不是带置信区间的统计结论；原始 JSONL 和完整失败明细见
+`benchmark/results.jsonl` 与 `benchmark/results.md`。
+
 ## 文件结构
 
 ```
 multi-agent/
+├── core/                   # Agent loop、tools、policy、audit、workflow、Docker sandbox
+├── benchmark/              # 22-case hidden-test benchmark + 正式结果
+├── docker/                 # 隔离执行镜像
+├── docs/                   # 路线图与 Phase 1–3 交接文档
+├── tests/                  # Phase 2/3 主回归测试
+├── pyproject.toml          # 可安装项目与依赖声明
+├── service_http.py         # 标准库本地 REST 服务
+├── service_api.py          # 可选 FastAPI 服务
+├── issue_to_pr.py          # Planner + Coder/Reviewer + workflow 适配层
 ├── coder_reviewer.py       # 用 core 重写的 Coder+Reviewer（结构化审查 + 沙箱）
 ├── graph_agents.py         # LangGraph 版编排（StateGraph + 条件边 + human-in-loop）
 ├── experiment.py           # 对照实验：独立 reviewer vs 自我审查
@@ -52,8 +122,8 @@ multi-agent/
 │   │   └── case02_stats/   #   mean 除零 / median 原地排序+偶数取错
 │   ├── cases/              # 运行时临时题目（可被 agent 污染，评测前自动恢复）
 │   ├── eval.py             # 评测主流程
-│   └── results.jsonl       # 结果记录（追加式）
-└── core/                   # 共享核心（见 agent项目/core/）
+│   └── results.jsonl       # 旧版实验结果（本地生成）
+└── .env.example            # 环境变量模板；真实 .env 永不提交
 ```
 
 ## 与旧版的三处关键差异
@@ -83,7 +153,7 @@ multi-agent/
 ## 运行
 
 ```bash
-# 单次演示（会在 multi-agent/ 目录跑，会就地改 buggy.py）
+# 单次演示（从仓库根目录运行，会就地改 buggy.py）
 python coder_reviewer.py
 
 # 跑完整评测（从 seeds 恢复纯净题目 → 修复 → pytest 验证 → 记录指标）
@@ -167,6 +237,7 @@ python experiment.py --cases case01_add --methods mreview,self
 
 ## 下一步（规划）
 
-- [ ] 扩充更难的 seed 用例，让修复率在不同方法间真正拉开差距
-- [ ] 加第三个 agent（Planner），从线性循环升级为 DAG
-- [ ] 用算好的指标出一页 mini-paper / 技术博客
+- [x] 扩充到 22 个公开/隐藏测试分离的确定性用例
+- [x] 加入 Planner，并完成 single/reviewer/planner 的 22×3 基线
+- [ ] 新增跨文件、需检索、契约更复杂的 harder suite
+- [ ] 用正式 dashboard 和失败案例写一页 mini-paper / 技术博客

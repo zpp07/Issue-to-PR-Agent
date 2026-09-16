@@ -25,8 +25,6 @@ import subprocess
 import tempfile
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from core.client import make_client
 from core.agent import run_agent
 from core.usage import Usage

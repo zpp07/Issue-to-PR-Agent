@@ -16,8 +16,7 @@ import shutil
 import subprocess
 import tempfile
 
-# eval/ 下：agent项目 根在两层之上，multi-agent 目录在一层之上
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# Support the legacy direct entry point: python eval/eval.py.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.client import make_client
