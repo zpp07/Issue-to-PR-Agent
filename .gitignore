@@ -11,3 +11,15 @@ venv/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# Generated or local-only evaluation state
+eval/cases/
+eval/results.jsonl
+eval/experiment_results.jsonl
+syntax_result.txt
+
+# Legacy local helpers with hard-coded machine paths (not project entry points)
+bug.md
+check_syntax.py
+run.sh
+run_normal.sh
