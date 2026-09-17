@@ -60,6 +60,8 @@ explicit approval for the expected time/cost and keep `--resume` enabled.
 
 The first standardized trial passed 3/6. Search-budgeted trial 2 on the three
 failures passed 0/3, leaving 3/9 total. Do not spend more trials on the same
-single-loop strategy. Implement and test a two-phase `plan_execute` strategy:
-the planner may search/read and must emit a structured plan; the executor gets
-that plan, cannot search, and can only read, edit, test and finish.
+single-loop strategy. The two-phase `plan_execute` strategy is implemented and
+unit-tested: the planner may search/read and must emit a structured plan; the
+executor gets that plan, cannot search, and can only read, edit, test and
+finish. The next paid action is one targeted `plan_execute` smoke on a failed
+case before running it across all three failures.

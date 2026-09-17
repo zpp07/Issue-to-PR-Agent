@@ -170,7 +170,9 @@ def run_agent(
                 # File/search results may contain source code. Keep only their
                 # size; mutation and command outcomes are safe and useful for
                 # diagnosing rejected edits or failed verification commands.
-                if name not in {"read_file", "search_code"}:
+                if name not in {"read_file", "search_code"} or rendered.startswith(
+                    "代码检索预算已耗尽"
+                ):
                     trace_record["result_preview"] = rendered[:300]
 
             # 终态工具：finish / review_finish / plan_finish —— 立即返回结构化结果

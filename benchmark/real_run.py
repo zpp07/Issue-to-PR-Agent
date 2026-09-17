@@ -30,6 +30,10 @@ from core.usage import Usage
 TOOLS = build_tool_registry(
     "search_code", "read_file", "replace_text", "write_file", "run_command", "finish"
 )
+PLANNER_TOOLS = build_tool_registry("search_code", "read_file", "plan_finish")
+EXECUTOR_TOOLS = build_tool_registry(
+    "read_file", "replace_text", "write_file", "run_command", "finish"
+)
 PROMPT = """You are repairing a real Python repository from a GitHub issue.
 Use search_code once or twice to locate relevant implementation and contract
 evidence. Its citations contain line numbers: inspect those regions with
@@ -43,6 +47,20 @@ rejected. run_command accepts pytest and ruff only, not python -c or shell
 commands. Repository commands run offline in an isolated container. Run focused
 tests when practical. Once the focused tests pass, stop investigating and call
 finish with a concise summary of the fix.
+"""
+PLANNER_PROMPT = """You are the read-only investigation phase of a Python repair agent.
+Use repository evidence to identify the most likely root cause and the smallest
+credible fix. You may search and read, but cannot edit or run commands. Do not
+keep searching for certainty: inspect the relevant implementation, then call
+plan_finish with concrete affected files, symbols/regions, edit steps, risks,
+and focused pytest commands. Never mention or assume hidden evaluator tests.
+"""
+EXECUTOR_PROMPT = """You are the execution phase of a Python repair agent.
+Implement the approved evidence-based plan. Search is intentionally unavailable:
+use bounded read_file calls to confirm exact text, make minimal changes with
+replace_text, and run focused pytest commands. You may edit existing production
+Python files only. Never edit tests, documentation, dependencies, or scratch
+files. Once focused tests pass, call finish instead of continuing investigation.
 """
 
 
@@ -90,7 +108,8 @@ def compact_trace(trace: list[dict]) -> list[dict]:
     compact = []
     for step in trace:
         args = step.get("args") or {}
-        row = {"step": step.get("step"), "action": step.get("action")}
+        row = {"phase": step.get("phase", "single"),
+               "step": step.get("step"), "action": step.get("action")}
         for key in ("path", "start_line", "end_line", "argv"):
             if key in args:
                 row[key] = args[key]
@@ -133,13 +152,14 @@ def generate_report(results_path: str | Path, report_path: str | Path) -> None:
         f"- Runs: {len(rows)}", f"- Passed: {passed}/{len(rows)}" if rows else "- Passed: 0/0",
         f"- Tokens: {tokens:,}", f"- Estimated cost: RMB {cost:.4f}",
         f"- Cumulative runtime: {elapsed / 60:.1f} minutes", "",
-        "| Case | Trial | Passed | Completed | Modified files | Gold recall | Tokens | Cost (RMB) |",
-        "|---|---:|---:|---:|---|---:|---:|---:|",
+        "| Case | Strategy | Trial | Passed | Completed | Modified files | Gold recall | Tokens | Cost (RMB) |",
+        "|---|---|---:|---:|---:|---|---:|---:|---:|",
     ]
     for row in rows:
         modified = ", ".join(f"`{path}`" for path in row["modified_files"]) or "-"
         lines.append(
-            f"| `{row['case']}` | {row['trial']} | {str(row['tests_pass']).lower()} | "
+            f"| `{row['case']}` | `{row.get('strategy', 'single')}` | {row['trial']} | "
+            f"{str(row['tests_pass']).lower()} | "
             f"{str(row['agent_completed']).lower()} | {modified} | "
             f"{row['gold_file_recall']:.0%} | {row['total_tokens']:,} | {row['cost_rmb']:.4f} |"
         )
@@ -161,16 +181,63 @@ def _prepare(case: RealCase, workspace: Path, sandbox: DockerSandbox) -> None:
         raise RuntimeError(f"Hydra parser generation failed: {result.output}")
 
 
+def _phase(trace: list[dict], name: str) -> list[dict]:
+    for step in trace:
+        step["phase"] = name
+    return trace
+
+
+def run_repair(client, strategy: str, task: str, executor, model: str,
+               max_steps: int, planner_steps: int,
+               max_tokens: int | None) -> tuple[object, Usage, list[dict], bool | None]:
+    usage = Usage()
+    if strategy == "single":
+        trace: list[dict] = []
+        result, usage = run_agent(
+            client, PROMPT, TOOLS, task, model=model, max_steps=max_steps,
+            execute_tool=with_search_budget(executor), usage=usage, trace=trace,
+            max_tokens=max_tokens,
+        )
+        return result, usage, _phase(trace, "single"), None
+
+    planner_trace: list[dict] = []
+    plan, usage = run_agent(
+        client, PLANNER_PROMPT, PLANNER_TOOLS, task, model=model,
+        max_steps=planner_steps, execute_tool=with_search_budget(executor),
+        usage=usage, trace=planner_trace, max_tokens=max_tokens,
+    )
+    planner_trace = _phase(planner_trace, "plan")
+    planner_completed = isinstance(plan, dict) and isinstance(plan.get("steps"), list)
+    if not planner_completed:
+        return plan, usage, planner_trace, False
+
+    execution_trace: list[dict] = []
+    execution_task = (
+        task.split("\n\nInitial retrieved evidence:", 1)[0]
+        + "\n\nApproved repair plan:\n"
+        + json.dumps(plan, ensure_ascii=False, indent=2)
+    )
+    result, usage = run_agent(
+        client, EXECUTOR_PROMPT, EXECUTOR_TOOLS, execution_task,
+        model=model, max_steps=max_steps, execute_tool=executor,
+        usage=usage, trace=execution_trace, max_tokens=max_tokens,
+    )
+    return result, usage, planner_trace + _phase(execution_trace, "execute"), True
+
+
 def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
                  docker_binary: str, model: str, trial: int,
-                 max_steps: int, max_tokens: int | None) -> dict:
+                 max_steps: int, max_tokens: int | None,
+                 strategy: str = "single", planner_steps: int = 10) -> dict:
     started = time.perf_counter()
     source = snapshot_directory(cache_root, case)
     if not source.is_dir():
         raise FileNotFoundError(f"snapshot is not prepared: {source}")
     runs = Path(cache_root) / "agent_runs"
     runs.mkdir(parents=True, exist_ok=True)
-    run_root = Path(tempfile.mkdtemp(prefix=f"{case.instance_id}-t{trial}-", dir=str(runs)))
+    run_root = Path(tempfile.mkdtemp(
+        prefix=f"{case.instance_id}-{strategy}-t{trial}-", dir=str(runs)
+    ))
     workspace = run_root / "workspace"
     try:
         shutil.copytree(source, workspace)
@@ -189,16 +256,14 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             f"Repository: {case.repo}\nIssue:\n{case.issue}\n\n"
             "Initial retrieved evidence:\n" + format_hits(initial_hits)
         )
-        usage, trace = Usage(), []
         executor = make_executor(
             workspace, policy=CommandPolicy(),
             command_runner=sandbox.command_runner(workspace),
             writable_files=editable, code_search=search,
         )
-        result, usage = run_agent(
-            make_client(), PROMPT, TOOLS, task, model=model, max_steps=max_steps,
-            execute_tool=with_search_budget(executor),
-            usage=usage, trace=trace, max_tokens=max_tokens,
+        result, usage, trace, planner_completed = run_repair(
+            make_client(), strategy, task, executor, model, max_steps,
+            planner_steps, max_tokens,
         )
         llm_errors = [step for step in trace if step.get("action") == "llm_error"]
         if llm_errors:
@@ -221,8 +286,10 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             workspace, command, read_only_workspace=True, timeout=300,
         )
         return {
-            "case": case.instance_id, "repo": case.repo, "trial": trial,
+            "case": case.instance_id, "repo": case.repo, "strategy": strategy,
+            "trial": trial,
             "model": model, "image": image, "agent_completed": agent_completed,
+            "planner_completed": planner_completed,
             "tests_pass": verification.exit_code == 0,
             "test_tampered": test_tampered, "container_timeout": verification.timed_out,
             "modified_files": modified, "gold_files": list(case.production_files),
@@ -255,13 +322,15 @@ def main() -> None:
     parser.add_argument("--model", default="deepseek-chat")
     parser.add_argument("--docker-binary", default="docker")
     parser.add_argument("--max-steps", type=int, default=25)
+    parser.add_argument("--planner-steps", type=int, default=10)
+    parser.add_argument("--strategy", choices=("single", "plan_execute"), default="single")
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--output", default="benchmark/real/results.jsonl")
     parser.add_argument("--report", help="default: output path with .md suffix")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
-    if args.trials < 1 or args.max_steps < 1:
-        parser.error("trials and max-steps must be positive")
+    if args.trials < 1 or args.max_steps < 1 or args.planner_steps < 1:
+        parser.error("trials, max-steps and planner-steps must be positive")
 
     selected = load_manifest(args.manifest, args.cases_file)
     if args.cases != "all":
@@ -276,19 +345,21 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     completed = set()
     if args.resume and output.is_file():
-        completed = {(row["case"], row["trial"], row["model"])
+        completed = {(row["case"], row.get("strategy", "single"),
+                      row["trial"], row["model"])
                      for row in (json.loads(line) for line in
                                  output.read_text(encoding="utf-8").splitlines()) if row}
     failures = []
     with output.open("a", encoding="utf-8") as stream:
         for case, image in selected:
             for trial in range(1, args.trials + 1):
-                if (case.instance_id, trial, args.model) in completed:
+                if (case.instance_id, args.strategy, trial, args.model) in completed:
                     continue
                 try:
                     row = evaluate_one(
                         case, image, args.cache_root, args.docker_binary,
                         args.model, trial, args.max_steps, args.max_tokens,
+                        args.strategy, args.planner_steps,
                     )
                 except Exception as exc:
                     failures.append((case.instance_id, trial, exc))
@@ -297,7 +368,7 @@ def main() -> None:
                     continue
                 stream.write(json.dumps(row, ensure_ascii=False) + "\n")
                 stream.flush()
-                print(f"{case.instance_id:36s} trial={trial} "
+                print(f"{case.instance_id:36s} {args.strategy:12s} trial={trial} "
                       f"pass={row['tests_pass']} tokens={row['total_tokens']}")
     generate_report(output, args.report or output.with_suffix(".md"))
     if failures:

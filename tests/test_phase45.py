@@ -2,6 +2,7 @@ from benchmark.import_swegym import normalize, summary
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -17,6 +18,7 @@ from benchmark.real_run import (
     editable_python_files,
     generate_report,
     load_manifest,
+    run_repair,
     with_search_budget,
 )
 from benchmark.real_snapshot import (
@@ -266,3 +268,47 @@ def test_real_runner_caps_repeated_search_and_generates_report(tmpdir):
     text = report.read_text()
     assert "Passed: 1/1" in text
     assert "`pkg/service.py`" in text
+
+
+def test_plan_execute_separates_read_only_planning_from_search_free_execution():
+    def tool_message(call_id, name, arguments):
+        call = SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+        )
+        return SimpleNamespace(content=None, tool_calls=[call])
+
+    responses = [
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=tool_message("plan", "plan_finish", {
+                "goal": "repair value", "affected_files": ["pkg/service.py"],
+                "steps": ["replace the wrong value"], "risks": ["regression"],
+                "allowed_commands": [["python", "-m", "pytest", "-q"]],
+            }))], usage=None, _request_id="planner",
+        ),
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=tool_message(
+                "finish", "finish", {"result": "implemented"}
+            ))], usage=None, _request_id="executor",
+        ),
+    ]
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    client = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(create=create)
+    ))
+    result, _, trace, planner_completed = run_repair(
+        client, "plan_execute", "Repository: owner/repo\nIssue: repair",
+        lambda name, args: "ok", "test-model", max_steps=3,
+        planner_steps=2, max_tokens=None,
+    )
+    planner_tools = {tool["function"]["name"] for tool in calls[0]["tools"]}
+    executor_tools = {tool["function"]["name"] for tool in calls[1]["tools"]}
+    assert result == "implemented" and planner_completed
+    assert "replace_text" not in planner_tools
+    assert "search_code" not in executor_tools
+    assert [step["phase"] for step in trace] == ["plan", "execute"]

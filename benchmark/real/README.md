@@ -141,3 +141,10 @@ but failed regression tests again. Across the nine recorded runs the score is
 that a search-call cap alone creates a reliable transition from investigation
 to action. The next strategy is an explicit read-only planning phase followed
 by a search-free execution phase.
+
+The runner now supports that strategy with `--strategy plan_execute`. Planning
+can search/read and must terminate in a structured `plan_finish`; execution
+receives the approved plan but has no search tool, so its budget is reserved for
+confirming exact code, editing and testing. Results include the strategy and
+phase-tagged traces, keeping comparisons separate from the original `single`
+baseline.
