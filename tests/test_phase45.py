@@ -6,7 +6,14 @@ import zipfile
 
 import pytest
 
-from benchmark.real_cases import CandidatePolicy, RealCase, patch_files, select_cases
+from benchmark.real_cases import (
+    CandidatePolicy,
+    RealCase,
+    patch_files,
+    select_cases,
+    write_jsonl,
+)
+from benchmark.real_run import editable_python_files, load_manifest
 from benchmark.real_snapshot import (
     SnapshotAudit,
     audit_snapshot,
@@ -191,3 +198,38 @@ def test_apply_is_relative_to_snapshot_nested_inside_another_git_repo(tmpdir):
 """
     _apply(workspace, nested_patch)
     assert (workspace / "pkg/service.py").read_text() == "return new\n"
+
+
+def test_verified_manifest_loads_only_known_unique_cases(tmpdir):
+    root = Path(str(tmpdir))
+    cases_path = root / "cases.jsonl"
+    manifest_path = root / "manifest.json"
+    write_jsonl(normalize([row()]), cases_path)
+    manifest_path.write_text(json.dumps({
+        "status": "tests_verified",
+        "cases": [{"instance_id": "owner__repo-1", "image": "runner:test"}],
+    }))
+    selected = load_manifest(manifest_path, cases_path)
+    assert [(case.instance_id, image) for case, image in selected] == [
+        ("owner__repo-1", "runner:test")
+    ]
+
+    manifest_path.write_text(json.dumps({
+        "status": "tests_verified",
+        "cases": [
+            {"instance_id": "owner__repo-1", "image": "runner:test"},
+            {"instance_id": "owner__repo-1", "image": "runner:test"},
+        ],
+    }))
+    with pytest.raises(ValueError, match="unique"):
+        load_manifest(manifest_path, cases_path)
+
+
+def test_real_runner_write_allowlist_excludes_tests_and_non_python(tmpdir):
+    root = Path(str(tmpdir))
+    (root / "pkg").mkdir()
+    (root / "tests").mkdir()
+    (root / "pkg/service.py").write_text("VALUE = 1\n")
+    (root / "pkg/config.yaml").write_text("value: 1\n")
+    (root / "tests/test_service.py").write_text("def test_value(): pass\n")
+    assert editable_python_files(root) == ["pkg/service.py"]

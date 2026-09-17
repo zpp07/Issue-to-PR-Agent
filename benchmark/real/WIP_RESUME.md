@@ -42,6 +42,7 @@ Six tasks are now `tests_verified` in `test_audit.jsonl`:
 
 Phase 4.5's six-task verification gate is complete and the scored set is frozen
 in `verified_manifest.json` (excluding the unverified MONAI reserve). The next
-session should run the current agent on it with multiple seeds, and only then
+session should run the current agent on it with repeated independent trials,
+using `python -m benchmark.real_run --trials 3 --resume`, and only then
 use those failures to scope Phase 6. Keep environment construction
 network-enabled, but all verification and agent runs networkless and read-only.

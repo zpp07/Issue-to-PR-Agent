@@ -95,3 +95,21 @@ credible environment requires a much larger Torch image. A task moves to
 `tests_verified` only after the pre-fix/post-fix transition is recorded. The
 six-task Phase 4.5 gate is now complete; Phase 6 can proceed without using the
 earlier toy suite as its only quality signal.
+
+Run one inexpensive smoke trial before a full repeated evaluation:
+
+```powershell
+python -m benchmark.real_run --cases dask__dask-7894 --trials 1
+```
+
+Then run three independent stochastic trials per verified task, with resumable
+JSONL output:
+
+```powershell
+python -m benchmark.real_run --trials 3 --resume
+```
+
+The provider does not expose a reliable random-seed control here, so these are
+recorded as independent `trial` values rather than falsely claiming seeded
+reproducibility. Each row records success, test tampering, modified/gold-file
+overlap, tool usage, tokens, estimated cost and elapsed time.
