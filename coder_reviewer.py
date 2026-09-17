@@ -19,6 +19,8 @@ from core.tools import build_tool_registry, make_executor
 
 CODERS = build_tool_registry("read_file", "write_file", "run_command", "finish")
 REVIEWERS = build_tool_registry("read_file", "review_finish")
+SEARCH_CODERS = build_tool_registry("search_code", "read_file", "write_file", "run_command", "finish")
+SEARCH_REVIEWERS = build_tool_registry("search_code", "read_file", "review_finish")
 
 CODER_PROMPT = """你是一个程序员，负责修复代码中的 bug。
 工作流程：先用 read_file 读代码定位问题，用 write_file 修改，用 run_command 跑测试验证。
@@ -42,7 +44,8 @@ REVIEWER_PROMPT = """你是一个认真负责的代码审查员。
 
 def multi_agent_review(client, target_file, task="修复代码中的 bug",
                        max_rounds=3, model="deepseek-chat",
-                       usage=None, trace=None, verbose=True, executor=None):
+                       usage=None, trace=None, verbose=True, executor=None,
+                       workspace=None, coder_tools=None, reviewer_tools=None):
     """Coder 修 → Reviewer 查 → 不通过喂回意见，最多 max_rounds 轮。
 
     返回 (passed, review_issues, rounds, usage)。
@@ -52,7 +55,10 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
     coder_task = task
     # 推导工作目录：目标文件所在目录。agent 的所有文件/命令操作都被限制在这里，
     # 避免它用 `cd` 逃出沙箱、污染工作区之外的文件。
-    workdir = os.path.dirname(os.path.abspath(target_file))
+    workdir = os.path.abspath(workspace) if workspace else os.path.dirname(os.path.abspath(target_file))
+    target_display = os.path.relpath(os.path.abspath(target_file), workdir)
+    coder_tools = coder_tools or CODERS
+    reviewer_tools = reviewer_tools or REVIEWERS
 
     for round_num in range(1, max_rounds + 1):
         if verbose:
@@ -62,9 +68,9 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
         if verbose:
             print("[Coder] 修复中...")
         coder_executor = executor or make_executor(workdir)
-        coder_task = coder_task.replace(target_file, os.path.basename(target_file))
+        coder_task = coder_task.replace(target_file, target_display)
         coder_result, usage = run_agent(
-            client, CODER_PROMPT, CODERS, coder_task,
+            client, CODER_PROMPT, coder_tools, coder_task,
             model=model, usage=usage, trace=trace,
             execute_tool=coder_executor,
         )
@@ -76,8 +82,8 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
             print("[Reviewer] 审查中...")
         review_executor = executor or make_executor(workdir)
         review, usage = run_agent(
-            client, REVIEWER_PROMPT, REVIEWERS,
-            f"请审查文件 {os.path.basename(target_file)} 的代码",
+            client, REVIEWER_PROMPT, reviewer_tools,
+            f"请审查文件 {target_display} 的代码",
             model=model, usage=usage, trace=trace,
             execute_tool=review_executor,
         )

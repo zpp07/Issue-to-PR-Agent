@@ -77,6 +77,21 @@ def run_command(argv, cwd=None, timeout=COMMAND_TIMEOUT):
 
 # ---------- 工具 schema（openai function calling 格式）----------
 TOOL_SCHEMAS = {
+    "search_code": {
+        "type": "function",
+        "function": {
+            "name": "search_code",
+            "description": "在代码库中进行 AST/文档结构切块后的混合检索，返回带文件与行号的证据",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "错误行为、符号、契约或相关关键词"},
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
     "read_file": {
         "type": "function",
         "function": {
@@ -182,7 +197,9 @@ TOOL_SCHEMAS = {
 
 # ---------- 工具执行器 ----------
 def execute_tool(name, args):
-    if name == "read_file":
+    if name == "search_code":
+        return "代码检索未绑定工作区"
+    elif name == "read_file":
         return read_file(args["path"])
     elif name == "write_file":
         return write_file(args["path"], args["content"])
@@ -199,7 +216,7 @@ def execute_tool(name, args):
 
 
 def make_executor(workdir, policy=None, approval_callback=None, command_runner=None,
-                  writable_files=None):
+                  writable_files=None, code_search=None):
     """返回绑定在指定工作目录上的工具执行器（无容器沙箱）。
 
     关键点（也是多 agent 里最重要的一个工程点）：
@@ -241,7 +258,12 @@ def make_executor(workdir, policy=None, approval_callback=None, command_runner=N
             allowed_writes.add(os.path.normcase(path))
 
     def executor(name, args):
-        if name == "read_file":
+        if name == "search_code":
+            if code_search is None:
+                return "代码检索未启用"
+            from core.search import format_hits
+            return format_hits(code_search.search(args["query"], args.get("top_k", 5)))
+        elif name == "read_file":
             p, inside = check_inside(args["path"])
             if not inside:
                 return f"拒绝读取：路径 {p} 在工作区之外"

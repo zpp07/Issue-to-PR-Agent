@@ -4,11 +4,11 @@ import json
 from pathlib import Path
 
 
-def render(records):
+def render(records, title="Phase 3 benchmark dashboard"):
     groups = defaultdict(list)
     for row in records:
         groups[row["method"]].append(row)
-    lines = ["# Phase 3 benchmark dashboard", "", "| Method | Cases | Hidden pass | Pass rate | Avg tokens | Avg cost (RMB) | Avg seconds | Test tampering |",
+    lines = [f"# {title}", "", "| Method | Cases | Hidden pass | Pass rate | Avg tokens | Avg cost (RMB) | Avg seconds | Test tampering |",
              "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for method in sorted(groups):
         rows = groups[method]
@@ -46,6 +46,6 @@ def render(records):
     return "\n".join(lines)
 
 
-def generate(jsonl_path, output_path):
+def generate(jsonl_path, output_path, title="Phase 3 benchmark dashboard"):
     rows = [json.loads(line) for line in Path(jsonl_path).read_text(encoding="utf-8").splitlines() if line.strip()]
-    Path(output_path).write_text(render(rows), encoding="utf-8")
+    Path(output_path).write_text(render(rows, title=title), encoding="utf-8")
