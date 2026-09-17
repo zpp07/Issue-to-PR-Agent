@@ -57,3 +57,9 @@ The post-tooling Dask smoke passed all 26 evaluator-selected tests, modified
 only the reference production file, and did not tamper with tests. It consumed
 325,328 tokens (estimated RMB 0.6915). Before launching all 18 runs, obtain
 explicit approval for the expected time/cost and keep `--resume` enabled.
+
+The first standardized trial passed 3/6. Search-budgeted trial 2 on the three
+failures passed 0/3, leaving 3/9 total. Do not spend more trials on the same
+single-loop strategy. Implement and test a two-phase `plan_execute` strategy:
+the planner may search/read and must emit a structured plan; the executor gets
+that plan, cannot search, and can only read, edit, test and finish.

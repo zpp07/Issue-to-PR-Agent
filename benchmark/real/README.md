@@ -133,3 +133,11 @@ estimated RMB 2.8051 over 19.1 cumulative minutes. Its failure traces motivated
 an eight-call search budget before additional trials: two failures reached the
 correct implementation but spent the remaining steps searching instead of
 editing.
+
+A targeted second trial on the three failures produced 0/3 additional passes.
+Hydra-1791 and Pydantic still made no edit; Hydra-1006 edited the correct file
+but failed regression tests again. Across the nine recorded runs the score is
+3/9, with 2,203,578 tokens and estimated RMB 4.5622. This falsifies the idea
+that a search-call cap alone creates a reliable transition from investigation
+to action. The next strategy is an explicit read-only planning phase followed
+by a search-free execution phase.
