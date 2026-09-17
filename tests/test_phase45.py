@@ -129,8 +129,10 @@ def test_snapshot_audit_marks_patch_verified_but_tests_not_run(tmpdir):
 
 def test_real_test_transition_requires_an_actual_pytest_failure():
     assert expected_pytest_failure(SandboxResult(1, "1 failed, 4 passed"))
+    assert expected_pytest_failure(SandboxResult(1, "=== FAILURES ===\ntest_regression"))
     assert not expected_pytest_failure(SandboxResult(2, "ERROR collecting tests"))
     assert not expected_pytest_failure(SandboxResult(1, "errors during collection"))
+    assert not expected_pytest_failure(SandboxResult(1, "INTERNALERROR failures"))
     assert normalize_pytest_target("tests/test_x.py::test_x[value]") == "tests/test_x.py::test_x"
 
 

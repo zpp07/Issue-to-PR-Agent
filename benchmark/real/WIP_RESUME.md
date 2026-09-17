@@ -16,34 +16,23 @@ Work is paused on branch `phase4.5-real-benchmark`.
   regression-test failures and runs the before/after transition in a
   read-only, networkless container.
 
-## Exact unresolved issue
+## Resolved during the short continuation
 
-The downloaded snapshots live below this project's `.git` directory. Git
-therefore discovers the parent `multi-agent` repository and reports every
-snapshot patch as `Skipped patch` with exit code 0. Passing `--no-index` alone
-does not change that behavior.
+Patch application now sets `GIT_CEILING_DIRECTORIES` to the parent of each
+snapshot and uses an explicit temporary patch file. The nested-repository
+regression test passes, and all six snapshots were re-audited with real patch
+application.
 
-The last diagnostic established that `GIT_CEILING_DIRECTORIES` must be set to
-the **parent of the snapshot root**, not the snapshot root itself. With the
-snapshot root as the ceiling, `git rev-parse --show-toplevel` still returns the
-main repository; with `root.parent` as the ceiling, it correctly reports that
-there is no Git repository.
+Two tasks are now `tests_verified` in `test_audit.jsonl`:
+
+- `facebookresearch__hydra-1791`: four regression failures before the fix;
+  52 selected tests pass after the fix.
+- `facebookresearch__hydra-1006`: six regression failures before the fix;
+  35 selected tests pass after the fix.
 
 ## First action when resuming
 
-In both `benchmark.real_snapshot.patch_applies` and
-`benchmark.real_verify._apply`, pass a copied environment to `subprocess.run`
-with:
-
-```python
-env["GIT_CEILING_DIRECTORIES"] = str(root.resolve().parent)
-```
-
-Then run, in order:
-
-1. `python -m pytest tests/test_phase45.py -q`
-2. `python -m benchmark.real_snapshot --limit 6 --context-files 40`
-3. `python -m benchmark.real_verify facebookresearch__hydra-1791 --image issue-to-pr-hydra:phase45 --docker-binary <absolute docker.exe> --pass-sample 5`
-
-Do not trust or commit `benchmark/real/test_audit.jsonl` until that sequence
-passes: the current file only records diagnostic harness failures.
+Build a pinned DVC environment and verify `iterative__dvc-4124` and
+`iterative__dvc-4185`. Then select the cheapest remaining two repositories to
+reach six verified tasks. Keep environment construction network-enabled, but
+all verification and later agent runs networkless and read-only.

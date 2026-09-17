@@ -10,6 +10,7 @@ import argparse
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -162,10 +163,12 @@ def patch_applies(root: str | Path, patch: str) -> tuple[bool, str]:
     try:
         with handle:
             handle.write(patch)
+        environment = os.environ.copy()
+        environment["GIT_CEILING_DIRECTORIES"] = str(root.resolve().parent)
         result = subprocess.run(
             ["git", "apply", "--no-index", "--check", "--whitespace=nowarn",
              Path(handle.name).name],
-            cwd=str(root), text=True, capture_output=True, check=False,
+            cwd=str(root), env=environment, text=True, capture_output=True, check=False,
         )
         message = (result.stderr or result.stdout).strip()
         return result.returncode == 0, message

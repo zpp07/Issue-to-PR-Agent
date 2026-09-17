@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -38,7 +39,8 @@ def expected_pytest_failure(result: SandboxResult) -> bool:
     output = result.output.lower()
     return (
         result.exit_code == 1
-        and " failed" in output
+        and (" failed" in output or "failures" in output)
+        and "internalerror" not in output
         and "error collecting" not in output
         and " errors during collection" not in output
     )
@@ -52,10 +54,12 @@ def _apply(root: Path, patch: str) -> None:
     try:
         with handle:
             handle.write(patch)
+        environment = os.environ.copy()
+        environment["GIT_CEILING_DIRECTORIES"] = str(root.resolve().parent)
         result = subprocess.run(
             ["git", "apply", "--no-index", "--whitespace=nowarn",
              Path(handle.name).name],
-            cwd=str(root), text=True, capture_output=True, check=False,
+            cwd=str(root), env=environment, text=True, capture_output=True, check=False,
         )
         if result.returncode:
             raise RuntimeError((result.stderr or result.stdout).strip())

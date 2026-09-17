@@ -39,13 +39,14 @@ curated execution candidate, not a validated benchmark task.
 | Instance | Repository files | Patch state | Top-10 retrieval finds gold file | Test state |
 |---|---:|---|---:|---|
 | `iterative__dvc-4124` | 372 | patch verified | no | not run |
-| `facebookresearch__hydra-1791` | 1,122 | patch verified | no | not run |
+| `facebookresearch__hydra-1791` | 1,122 | patch verified | no | verified: 4 fail before, 52 pass after |
 | `iterative__dvc-4185` | 374 | patch verified | no | not run |
 | `Project-MONAI__MONAI-3326` | 777 | patch verified | yes | not run |
 | `pydantic__pydantic-8977` | 401 | patch verified | no | not run |
-| `facebookresearch__hydra-1006` | 723 | patch verified | no | not run |
+| `facebookresearch__hydra-1006` | 723 | patch verified | no | verified: 6 fail before, 35 pass after |
 
-All six exact snapshots and patches are structurally valid. The current
+All six exact snapshots and patches are structurally valid. Two Hydra tasks
+also pass the full pre-fix/post-fix transition in a networkless container. The current
 dependency-free hybrid retriever recalls the edited production file for only
 1/6 tasks at top 10. This is a useful negative result: the earlier six-task
 synthetic suite was too small/easy to establish retrieval quality.
@@ -79,9 +80,9 @@ git-ignored. The normalized candidate manifest and audit evidence are tracked.
 ## Remaining gate before scored runs
 
 The official prebuilt SWE-Gym images were not anonymously pullable from the
-documented registry during this run. The next implementation step is a
-repository-aware environment builder for a smaller subset (start with Hydra
-and DVC), with pinned Python/dependencies and network disabled during actual
-test and agent execution. A task moves to `tests_verified` only after the
+documented registry during this run. A pinned Hydra environment is therefore
+provided in `docker/hydra.Dockerfile`; it has verified two tasks with network
+disabled during execution. The next step is an equivalent DVC environment for
+the two selected DVC tasks. A task moves to `tests_verified` only after the
 pre-fix/post-fix transition is recorded. Phase 6 should wait until at least
 three, preferably six, tasks clear this gate.
