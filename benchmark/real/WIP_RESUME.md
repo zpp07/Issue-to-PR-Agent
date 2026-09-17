@@ -72,3 +72,11 @@ the Planner read the correct region but exhausted 10 steps without calling
 read limits are now aligned, and the final planner step has a forced terminal
 reminder. All 40 tests pass. The next paid action, after approval, is a second
 Hydra-1791 `plan_execute` trial to validate this specific fix.
+
+The second trial validated the transition: Planner completed and Executor
+edited the correct file, but the candidate failed an existing package test and
+could not revise successfully (478,796 tokens, estimated RMB 1.0112). The next
+bottleneck is patch review/revision, not retrieval. The runner now saves the
+structured plan and capped Agent diff for new runs and automatically retries a
+retryable provider disconnect once. All 41 tests pass. Do not rerun blindly;
+design a reviewer/revision pass that consumes the failed focused-test evidence.

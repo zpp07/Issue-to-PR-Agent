@@ -157,3 +157,12 @@ than the Agent loop's old 2,000-character tool-output limit. The limits are now
 aligned at 12,000 characters/bytes, whole-file reads above that size require an
 explicit line range, and the Planner receives a final-step instruction that
 requires `plan_finish` instead of another read/search.
+
+On the next Hydra-1791 trial, that fix worked: planning completed and execution
+modified the correct `hydra/core/default_element.py`. The candidate still
+failed because its implementation broke an existing global-package test; the
+Executor detected the regression but could not repair it before 25 steps. The
+run used 478,796 tokens (estimated RMB 1.0112). This moves the bottleneck from
+phase transition to patch correctness/revision. Future rows now retain the
+structured repair plan and a capped unified Agent diff, and retryable provider
+disconnects receive one whole-job retry without becoming model failures.

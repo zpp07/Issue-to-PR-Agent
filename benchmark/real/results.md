@@ -1,10 +1,10 @@
 # Real-repository benchmark results
 
-- Runs: 10
-- Passed: 3/10
-- Tokens: 2,264,492
-- Estimated cost: RMB 4.6896
-- Cumulative runtime: 32.7 minutes
+- Runs: 11
+- Passed: 3/11
+- Tokens: 2,743,288
+- Estimated cost: RMB 5.7008
+- Cumulative runtime: 39.3 minutes
 
 | Case | Strategy | Trial | Passed | Completed | Modified files | Gold recall | Tokens | Cost (RMB) |
 |---|---|---:|---:|---:|---|---:|---:|---:|
@@ -18,3 +18,4 @@
 | `pydantic__pydantic-8977` | `single` | 2 | false | false | - | 0% | 288,847 | 0.5976 |
 | `facebookresearch__hydra-1006` | `single` | 2 | false | false | `hydra/_internal/utils.py` | 100% | 315,230 | 0.6457 |
 | `facebookresearch__hydra-1791` | `plan_execute` | 1 | false | false | - | 0% | 60,914 | 0.1274 |
+| `facebookresearch__hydra-1791` | `plan_execute` | 2 | false | false | `hydra/core/default_element.py` | 100% | 478,796 | 1.0112 |

@@ -7,6 +7,7 @@ after the agent finishes.
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 from pathlib import Path
@@ -62,6 +63,12 @@ replace_text, and run focused pytest commands. You may edit existing production
 Python files only. Never edit tests, documentation, dependencies, or scratch
 files. Once focused tests pass, call finish instead of continuing investigation.
 """
+
+
+class EvaluationInfrastructureError(RuntimeError):
+    def __init__(self, message: str, retryable: bool):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def load_manifest(manifest_path: str | Path,
@@ -173,6 +180,23 @@ def _fingerprints(workspace: Path, paths: list[str]) -> dict[str, str]:
             for path in paths}
 
 
+def _agent_patch(source: Path, workspace: Path, modified: list[str],
+                 limit: int = 20_000) -> str:
+    chunks = []
+    for relative in modified:
+        before = (source / relative).read_text(encoding="utf-8").splitlines(keepends=True)
+        after = (workspace / relative).read_text(encoding="utf-8").splitlines(keepends=True)
+        chunks.extend(difflib.unified_diff(
+            before, after, fromfile=f"a/{relative}", tofile=f"b/{relative}",
+        ))
+        if sum(len(chunk) for chunk in chunks) >= limit:
+            break
+    patch = "".join(chunks)
+    if len(patch) > limit:
+        patch = patch[:limit] + f"\n...[agent patch truncated at {limit} characters]"
+    return patch
+
+
 def _prepare(case: RealCase, workspace: Path, sandbox: DockerSandbox) -> None:
     if case.repo != "facebookresearch/hydra":
         return
@@ -189,7 +213,8 @@ def _phase(trace: list[dict], name: str) -> list[dict]:
 
 def run_repair(client, strategy: str, task: str, executor, model: str,
                max_steps: int, planner_steps: int,
-               max_tokens: int | None) -> tuple[object, Usage, list[dict], bool | None]:
+               max_tokens: int | None
+               ) -> tuple[object, Usage, list[dict], bool | None, dict | None]:
     usage = Usage()
     if strategy == "single":
         trace: list[dict] = []
@@ -198,7 +223,7 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
             execute_tool=with_search_budget(executor), usage=usage, trace=trace,
             max_tokens=max_tokens,
         )
-        return result, usage, _phase(trace, "single"), None
+        return result, usage, _phase(trace, "single"), None, None
 
     planner_trace: list[dict] = []
     plan, usage = run_agent(
@@ -213,7 +238,7 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
     planner_trace = _phase(planner_trace, "plan")
     planner_completed = isinstance(plan, dict) and isinstance(plan.get("steps"), list)
     if not planner_completed:
-        return plan, usage, planner_trace, False
+        return plan, usage, planner_trace, False, None
 
     execution_trace: list[dict] = []
     execution_task = (
@@ -226,7 +251,7 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
         model=model, max_steps=max_steps, execute_tool=executor,
         usage=usage, trace=execution_trace, max_tokens=max_tokens,
     )
-    return result, usage, planner_trace + _phase(execution_trace, "execute"), True
+    return result, usage, planner_trace + _phase(execution_trace, "execute"), True, plan
 
 
 def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
@@ -265,7 +290,7 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             command_runner=sandbox.command_runner(workspace),
             writable_files=editable, code_search=search,
         )
-        result, usage, trace, planner_completed = run_repair(
+        result, usage, trace, planner_completed, repair_plan = run_repair(
             make_client(), strategy, task, executor, model, max_steps,
             planner_steps, max_tokens,
         )
@@ -273,13 +298,17 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
         if llm_errors:
             # Provider/runtime failures are missing observations, not model
             # failures, and must never become scored rows.
-            raise RuntimeError(llm_errors[-1].get("error", "LLM failure"))
+            latest = llm_errors[-1]
+            raise EvaluationInfrastructureError(
+                latest.get("error", "LLM failure"), bool(latest.get("retryable"))
+            )
         agent_completed = not isinstance(result, dict)
 
         after_tests = _fingerprints(workspace, test_paths)
         after_editable = _fingerprints(workspace, editable)
         modified = sorted(path for path in editable
                           if before_editable[path] != after_editable[path])
+        agent_patch = _agent_patch(source, workspace, modified)
         test_tampered = before_tests != after_tests
 
         # Evaluator-only material enters the workspace only after the agent is done.
@@ -294,9 +323,11 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             "trial": trial,
             "model": model, "image": image, "agent_completed": agent_completed,
             "planner_completed": planner_completed,
+            "repair_plan": repair_plan,
             "tests_pass": verification.exit_code == 0,
             "test_tampered": test_tampered, "container_timeout": verification.timed_out,
             "modified_files": modified, "gold_files": list(case.production_files),
+            "agent_patch": agent_patch,
             "gold_file_recall": (len(set(modified).intersection(case.production_files)) /
                                  len(case.production_files)),
             "fail_to_pass_count": len(case.fail_to_pass),
@@ -360,11 +391,20 @@ def main() -> None:
                 if (case.instance_id, args.strategy, trial, args.model) in completed:
                     continue
                 try:
-                    row = evaluate_one(
-                        case, image, args.cache_root, args.docker_binary,
-                        args.model, trial, args.max_steps, args.max_tokens,
-                        args.strategy, args.planner_steps,
-                    )
+                    for attempt in range(2):
+                        try:
+                            row = evaluate_one(
+                                case, image, args.cache_root, args.docker_binary,
+                                args.model, trial, args.max_steps, args.max_tokens,
+                                args.strategy, args.planner_steps,
+                            )
+                            break
+                        except EvaluationInfrastructureError as exc:
+                            if attempt == 1 or not exc.retryable:
+                                raise
+                            print(f"RETRY {case.instance_id} trial={trial}: {exc}",
+                                  file=sys.stderr, flush=True)
+                            time.sleep(1)
                 except Exception as exc:
                     failures.append((case.instance_id, trial, exc))
                     print(f"ERROR {case.instance_id} trial={trial}: {exc}",

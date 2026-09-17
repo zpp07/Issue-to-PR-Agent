@@ -15,6 +15,7 @@ from benchmark.real_cases import (
     write_jsonl,
 )
 from benchmark.real_run import (
+    _agent_patch,
     editable_python_files,
     generate_report,
     load_manifest,
@@ -301,7 +302,7 @@ def test_plan_execute_separates_read_only_planning_from_search_free_execution():
     client = SimpleNamespace(chat=SimpleNamespace(
         completions=SimpleNamespace(create=create)
     ))
-    result, _, trace, planner_completed = run_repair(
+    result, _, trace, planner_completed, plan = run_repair(
         client, "plan_execute", "Repository: owner/repo\nIssue: repair",
         lambda name, args: "ok", "test-model", max_steps=3,
         planner_steps=2, max_tokens=None,
@@ -309,6 +310,19 @@ def test_plan_execute_separates_read_only_planning_from_search_free_execution():
     planner_tools = {tool["function"]["name"] for tool in calls[0]["tools"]}
     executor_tools = {tool["function"]["name"] for tool in calls[1]["tools"]}
     assert result == "implemented" and planner_completed
+    assert plan["goal"] == "repair value"
     assert "replace_text" not in planner_tools
     assert "search_code" not in executor_tools
     assert [step["phase"] for step in trace] == ["plan", "execute"]
+
+
+def test_real_runner_records_agent_patch_without_reference_solution(tmpdir):
+    root = Path(str(tmpdir))
+    source, workspace = root / "source", root / "workspace"
+    (source / "pkg").mkdir(parents=True)
+    (workspace / "pkg").mkdir(parents=True)
+    (source / "pkg/service.py").write_text("value = 1\n")
+    (workspace / "pkg/service.py").write_text("value = 2\n")
+    patch = _agent_patch(source, workspace, ["pkg/service.py"])
+    assert "-value = 1" in patch
+    assert "+value = 2" in patch
