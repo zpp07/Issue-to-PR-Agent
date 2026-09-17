@@ -27,13 +27,18 @@ from core.tools import build_tool_registry, make_executor
 from core.usage import Usage
 
 
-TOOLS = build_tool_registry("search_code", "read_file", "write_file", "run_command", "finish")
+TOOLS = build_tool_registry(
+    "search_code", "read_file", "replace_text", "write_file", "run_command", "finish"
+)
 PROMPT = """You are repairing a real Python repository from a GitHub issue.
-Use search_code to locate relevant implementation and contract evidence, then
-read the necessary files before editing. You may edit existing production
-Python files only. Never edit tests, documentation, generated benchmark data,
-or dependency files. Repository commands run offline in an isolated container.
-Run focused tests when practical and finish with a concise summary of the fix.
+Use search_code once or twice to locate relevant implementation and contract
+evidence. Its citations contain line numbers: inspect those regions with
+read_file start_line/end_line rather than repeatedly searching or reading a
+large file from its beginning. Prefer replace_text for small, exact edits. You
+may edit existing production Python files only. Never edit tests, documentation,
+generated benchmark data, or dependency files. Repository commands run offline
+in an isolated container. Run focused tests when practical and finish with a
+concise summary of the fix.
 """
 
 
@@ -61,6 +66,34 @@ def load_manifest(manifest_path: str | Path,
 def editable_python_files(workspace: str | Path) -> list[str]:
     return [path for path in searchable_files(workspace)
             if path.endswith(".py") and not is_test_path(path)]
+
+
+def initial_evidence(search: HybridCodeSearch, issue: str, file_limit: int = 3):
+    """Keep the initial prompt focused: one best chunk from each selected file."""
+    selected, paths = [], set()
+    for hit in search.search(issue, top_k=10, candidate_k=50):
+        if hit.chunk.path in paths:
+            continue
+        selected.append(hit)
+        paths.add(hit.chunk.path)
+        if len(selected) >= file_limit:
+            break
+    return selected
+
+
+def compact_trace(trace: list[dict]) -> list[dict]:
+    """Persist navigation decisions without copying source/edit contents."""
+    compact = []
+    for step in trace:
+        args = step.get("args") or {}
+        row = {"step": step.get("step"), "action": step.get("action")}
+        for key in ("path", "start_line", "end_line", "argv"):
+            if key in args:
+                row[key] = args[key]
+        if "query" in args:
+            row["query"] = str(args["query"])[:200]
+        compact.append(row)
+    return compact
 
 
 def _fingerprints(workspace: Path, paths: list[str]) -> dict[str, str]:
@@ -99,7 +132,7 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
         before_tests = _fingerprints(workspace, test_paths)
         before_editable = _fingerprints(workspace, editable)
         search = HybridCodeSearch(workspace)
-        initial_hits = search.search(case.issue, top_k=5, candidate_k=50)
+        initial_hits = initial_evidence(search, case.issue)
         task = (
             f"Repository: {case.repo}\nIssue:\n{case.issue}\n\n"
             "Initial retrieved evidence:\n" + format_hits(initial_hits)
@@ -150,6 +183,7 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             "cost_rmb": round(usage.cost_rmb(), 6),
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "trace_steps": len(trace),
+            "trace": compact_trace(trace),
             "search_calls": 1 + sum(step.get("action") == "search_code" for step in trace),
             "read_calls": sum(step.get("action") == "read_file" for step in trace),
             "verification_output": verification.output[-1000:],

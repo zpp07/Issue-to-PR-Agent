@@ -46,3 +46,9 @@ session should run the current agent on it with repeated independent trials,
 using `python -m benchmark.real_run --trials 3 --resume`, and only then
 use those failures to scope Phase 6. Keep environment construction
 network-enabled, but all verification and agent runs networkless and read-only.
+
+The first Dask smoke exposed a real tooling bottleneck: search found
+`dask/array/overlap.py`, but whole-file reads only returned the beginning of
+the file and whole-file writes made a surgical fix impractical. The runner now
+offers bounded line-range reads plus exact `replace_text` edits and records a
+compact, source-free navigation trace for subsequent diagnosis.

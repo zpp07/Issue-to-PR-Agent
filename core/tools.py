@@ -15,22 +15,46 @@ import subprocess
 
 # ---------- Phase 1 可靠性：上限与超时 ----------
 MAX_FILE_BYTES = 200 * 1024     # 读/写文件大小上限（200KB），防止超大文件塞爆上下文
+MAX_READ_LINES = 400            # 单次分段读取上限，避免大文件淹没上下文
 MAX_COMMAND_OUTPUT = 4000       # 命令输出截断长度
 COMMAND_TIMEOUT = 30            # 命令默认超时（秒），防止挂起命令卡死 agent
 
 
 # ---------- 基础文件/命令工具 ----------
-def read_file(path):
+def read_file(path, start_line=None, end_line=None):
+    ranged = start_line is not None or end_line is not None
+    if ranged:
+        start_line = 1 if start_line is None else start_line
+        end_line = start_line + 199 if end_line is None else end_line
+        if (not isinstance(start_line, int) or isinstance(start_line, bool)
+                or not isinstance(end_line, int) or isinstance(end_line, bool)
+                or start_line < 1 or end_line < start_line):
+            return "读取失败：start_line/end_line 必须是有效的正整数范围"
+        if end_line - start_line + 1 > MAX_READ_LINES:
+            return f"读取失败：单次最多读取 {MAX_READ_LINES} 行"
     try:
         size = os.path.getsize(path)
     except OSError as e:
         return f"读取失败：{e}"
-    if size > MAX_FILE_BYTES:
+    if not ranged and size > MAX_FILE_BYTES:
         return (f"文件过大（{size} 字节，上限 {MAX_FILE_BYTES}），拒绝整体读取。"
-                f"请改用 run_command 的 grep/find 定位后再精读。")
+                "请使用 start_line/end_line 分段读取。")
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+            if not ranged:
+                return f.read()
+            lines = []
+            for number, line in enumerate(f, start=1):
+                if number > end_line:
+                    break
+                if number >= start_line:
+                    lines.append(f"{number}: {line.rstrip()}\n")
+            output = "".join(lines)
+            if not output:
+                return f"读取范围超出文件：{start_line}-{end_line}"
+            if len(output.encode("utf-8")) > MAX_FILE_BYTES:
+                return f"读取结果过大（上限 {MAX_FILE_BYTES} 字节），请缩小行范围"
+            return output
     except (OSError, UnicodeDecodeError) as e:
         return f"读取失败：{e}"
 
@@ -46,6 +70,31 @@ def write_file(path, content):
         return f"已写入 {path}（{len(content)} 字符）"
     except OSError as e:
         return f"写入失败：{e}"
+
+
+def replace_text(path, old, new):
+    """Replace one exact, unique text fragment without rewriting a whole file."""
+    if not isinstance(old, str) or not old:
+        return "替换失败：old 必须是非空字符串"
+    if not isinstance(new, str):
+        return "替换失败：new 必须是字符串"
+    if len(old.encode("utf-8")) > MAX_FILE_BYTES or len(new.encode("utf-8")) > MAX_FILE_BYTES:
+        return f"替换失败：old/new 超过 {MAX_FILE_BYTES} 字节上限"
+    try:
+        size = os.path.getsize(path)
+        if size > MAX_FILE_BYTES:
+            return f"替换失败：文件过大（{size} 字节，上限 {MAX_FILE_BYTES}）"
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        occurrences = content.count(old)
+        if occurrences != 1:
+            return f"替换失败：old 必须精确匹配一次，实际匹配 {occurrences} 次"
+        updated = content.replace(old, new, 1)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(updated)
+        return f"已更新 {path}（精确替换 1 处）"
+    except (OSError, UnicodeDecodeError) as e:
+        return f"替换失败：{e}"
 
 
 def run_command(argv, cwd=None, timeout=COMMAND_TIMEOUT):
@@ -96,11 +145,31 @@ TOOL_SCHEMAS = {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取指定文件的完整内容",
+            "description": "读取文件；大文件或定位到行号后应使用 start_line/end_line 分段读取",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "文件路径"}},
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1},
+                },
                 "required": ["path"],
+            },
+        },
+    },
+    "replace_text": {
+        "type": "function",
+        "function": {
+            "name": "replace_text",
+            "description": "在现有文件中把唯一匹配的 old 精确替换为 new，适合局部代码修改",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径"},
+                    "old": {"type": "string", "description": "必须且只能匹配一次的原文本"},
+                    "new": {"type": "string", "description": "替换后的文本"},
+                },
+                "required": ["path", "old", "new"],
             },
         },
     },
@@ -200,9 +269,11 @@ def execute_tool(name, args):
     if name == "search_code":
         return "代码检索未绑定工作区"
     elif name == "read_file":
-        return read_file(args["path"])
+        return read_file(args["path"], args.get("start_line"), args.get("end_line"))
     elif name == "write_file":
         return write_file(args["path"], args["content"])
+    elif name == "replace_text":
+        return replace_text(args["path"], args["old"], args["new"])
     elif name == "run_command":
         return run_command(args["argv"])
     elif name == "finish":
@@ -267,7 +338,7 @@ def make_executor(workdir, policy=None, approval_callback=None, command_runner=N
             p, inside = check_inside(args["path"])
             if not inside:
                 return f"拒绝读取：路径 {p} 在工作区之外"
-            return read_file(p)
+            return read_file(p, args.get("start_line"), args.get("end_line"))
         elif name == "write_file":
             p, inside = check_inside(args["path"])
             if not inside:
@@ -275,6 +346,13 @@ def make_executor(workdir, policy=None, approval_callback=None, command_runner=N
             if allowed_writes is not None and os.path.normcase(p) not in allowed_writes:
                 return f"拒绝写入：路径 {p} 不在本任务的写入 allowlist"
             return write_file(p, args["content"])
+        elif name == "replace_text":
+            p, inside = check_inside(args["path"])
+            if not inside:
+                return f"拒绝写入：路径 {p} 在工作区之外"
+            if allowed_writes is not None and os.path.normcase(p) not in allowed_writes:
+                return f"拒绝写入：路径 {p} 不在本任务的写入 allowlist"
+            return replace_text(p, args["old"], args["new"])
         elif name == "run_command":
             argv = args.get("argv")
             if policy is not None:

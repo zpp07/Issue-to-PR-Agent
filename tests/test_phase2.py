@@ -7,7 +7,7 @@ import pytest
 from core.audit import TaskStore
 from core.client import StdlibOpenAI, make_client
 from core.policy import CommandLevel, CommandPolicy
-from core.tools import run_command, write_file
+from core.tools import make_executor, read_file, replace_text, run_command, write_file
 from core.workflow import IssueToPRWorkflow
 
 
@@ -36,6 +36,32 @@ def test_write_file_enforces_byte_limit(tmpdir):
     result = write_file(tmp_path / "oversized.txt", "x" * (201 * 1024))
     assert "内容过大" in result
     assert not (tmp_path / "oversized.txt").exists()
+
+
+def test_read_file_supports_bounded_line_ranges(tmpdir):
+    path = Path(str(tmpdir)) / "large.py"
+    path.write_text("".join(f"line {number}\n" for number in range(1, 501)))
+    assert read_file(path, 473, 475) == (
+        "473: line 473\n474: line 474\n475: line 475\n"
+    )
+    assert "最多读取" in read_file(path, 1, 401)
+
+
+def test_replace_text_requires_one_match_and_obeys_executor_allowlist(tmpdir):
+    root = Path(str(tmpdir))
+    allowed = root / "allowed.py"
+    denied = root / "denied.py"
+    allowed.write_text("value = 1\n")
+    denied.write_text("value = 1\n")
+    executor = make_executor(root, writable_files=["allowed.py"])
+    assert "精确替换 1 处" in executor(
+        "replace_text", {"path": "allowed.py", "old": "value = 1", "new": "value = 2"}
+    )
+    assert allowed.read_text() == "value = 2\n"
+    assert "allowlist" in executor(
+        "replace_text", {"path": "denied.py", "old": "value = 1", "new": "value = 2"}
+    )
+    assert "实际匹配 0 次" in replace_text(allowed, "missing", "replacement")
 
 
 def test_approval_binds_exact_plan_and_diff(tmpdir):
