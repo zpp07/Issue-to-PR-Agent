@@ -1,11 +1,14 @@
 from benchmark.import_swegym import normalize, summary
 from pathlib import Path
+import subprocess
 import zipfile
 
 import pytest
 
 from benchmark.real_cases import CandidatePolicy, RealCase, patch_files, select_cases
 from benchmark.real_snapshot import audit_snapshot, extract_archive, validate_identity
+from benchmark.real_verify import _apply, expected_pytest_failure, normalize_pytest_target
+from core.sandbox import SandboxResult
 
 
 GOLD = """diff --git a/pkg/service.py b/pkg/service.py
@@ -119,3 +122,31 @@ def test_snapshot_audit_marks_patch_verified_but_tests_not_run(tmpdir):
     assert audit.test_state == "not_run"
     assert audit.gold_patch_applies and audit.test_patch_applies
     assert len(audit.context_files) == 15
+    _apply(tmp_path, case.gold_patch)
+    assert (tmp_path / "pkg/service.py").read_text() == "return new\n"
+    assert (tmp_path / "pkg/config.py").read_text() == "TIMEOUT = 2\n"
+
+
+def test_real_test_transition_requires_an_actual_pytest_failure():
+    assert expected_pytest_failure(SandboxResult(1, "1 failed, 4 passed"))
+    assert not expected_pytest_failure(SandboxResult(2, "ERROR collecting tests"))
+    assert not expected_pytest_failure(SandboxResult(1, "errors during collection"))
+    assert normalize_pytest_target("tests/test_x.py::test_x[value]") == "tests/test_x.py::test_x"
+
+
+def test_apply_is_relative_to_snapshot_nested_inside_another_git_repo(tmpdir):
+    parent = Path(str(tmpdir))
+    subprocess.run(["git", "init", "-q", str(parent)], check=True)
+    workspace = parent / "cache" / "snapshot"
+    workspace.mkdir(parents=True)
+    (workspace / "pkg").mkdir()
+    (workspace / "pkg/service.py").write_text("return old\n")
+    nested_patch = """diff --git a/pkg/service.py b/pkg/service.py
+--- a/pkg/service.py
++++ b/pkg/service.py
+@@ -1 +1 @@
+-return old
++return new
+"""
+    _apply(workspace, nested_patch)
+    assert (workspace / "pkg/service.py").read_text() == "return new\n"

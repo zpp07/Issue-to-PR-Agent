@@ -15,6 +15,7 @@ import re
 import shutil
 import ssl
 import subprocess
+import tempfile
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 import zipfile
 
@@ -153,12 +154,26 @@ def searchable_files(root: str | Path) -> list[str]:
 def patch_applies(root: str | Path, patch: str) -> tuple[bool, str]:
     if not patch.strip():
         return False, "empty patch"
-    result = subprocess.run(
-        ["git", "apply", "--check", "--whitespace=nowarn", "-"],
-        cwd=str(root), input=patch, text=True, capture_output=True, check=False,
+    root = Path(root)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", suffix=".patch",
+        prefix="benchmark-", dir=str(root), delete=False,
     )
-    message = (result.stderr or result.stdout).strip()
-    return result.returncode == 0, message
+    try:
+        with handle:
+            handle.write(patch)
+        result = subprocess.run(
+            ["git", "apply", "--no-index", "--check", "--whitespace=nowarn",
+             Path(handle.name).name],
+            cwd=str(root), text=True, capture_output=True, check=False,
+        )
+        message = (result.stderr or result.stdout).strip()
+        return result.returncode == 0, message
+    finally:
+        try:
+            Path(handle.name).unlink()
+        except FileNotFoundError:
+            pass
 
 
 @dataclass(frozen=True)
