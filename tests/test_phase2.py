@@ -46,6 +46,10 @@ def test_read_file_supports_bounded_line_ranges(tmpdir):
     )
     assert "最多读取" in read_file(path, 1, 401)
 
+    oversized = Path(str(tmpdir)) / "needs_range.py"
+    oversized.write_text("x = 1\n" * 3000)
+    assert "分段读取" in read_file(oversized)
+
 
 def test_replace_text_requires_one_match_and_obeys_executor_allowlist(tmpdir):
     root = Path(str(tmpdir))

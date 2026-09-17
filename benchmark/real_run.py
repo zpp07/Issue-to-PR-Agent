@@ -205,6 +205,10 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
         client, PLANNER_PROMPT, PLANNER_TOOLS, task, model=model,
         max_steps=planner_steps, execute_tool=with_search_budget(executor),
         usage=usage, trace=planner_trace, max_tokens=max_tokens,
+        final_step_prompt=(
+            "This is the final planning step. Do not search or read again. "
+            "Call plan_finish now using the strongest evidence already collected."
+        ),
     )
     planner_trace = _phase(planner_trace, "plan")
     planner_completed = isinstance(plan, dict) and isinstance(plan.get("steps"), list)

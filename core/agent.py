@@ -29,7 +29,7 @@ from core.tools import execute_tool as default_execute_tool
 log = logging.getLogger("core.agent")
 
 # 喂回模型的工具输出上限：超过则截断，防止一个 run_command 的输出塞爆上下文
-MAX_TOOL_OUTPUT = 2000
+MAX_TOOL_OUTPUT = 12000
 
 
 def _llm_call(client, messages, tools, model):
@@ -79,6 +79,7 @@ def run_agent(
     trace=None,
     max_tokens=None,
     max_cost_rmb=None,
+    final_step_prompt=None,
 ):
     """
     通用 agent 循环。
@@ -114,6 +115,8 @@ def run_agent(
     ]
 
     for step in range(max_steps):
+        if final_step_prompt and step == max_steps - 1:
+            messages.append({"role": "user", "content": final_step_prompt})
         try:
             message, (pt, ct), request_id, provider_request_id = _llm_call(
                 client, messages, tools.schemas(), model

@@ -65,3 +65,10 @@ unit-tested: the planner may search/read and must emit a structured plan; the
 executor gets that plan, cannot search, and can only read, edit, test and
 finish. The next paid action is one targeted `plan_execute` smoke on a failed
 case before running it across all three failures.
+
+That first Hydra-1791 `plan_execute` smoke failed in planning, not execution:
+the Planner read the correct region but exhausted 10 steps without calling
+`plan_finish` (60,914 tokens, estimated RMB 0.1274). Tool-output and whole-file
+read limits are now aligned, and the final planner step has a forced terminal
+reminder. All 40 tests pass. The next paid action, after approval, is a second
+Hydra-1791 `plan_execute` trial to validate this specific fix.

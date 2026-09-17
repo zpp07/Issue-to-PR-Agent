@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import py_compile
 from types import SimpleNamespace
 
@@ -87,6 +88,45 @@ def test_agent_accepts_provider_message_without_tool_calls_attribute():
         client, "system", build_tool_registry("finish"), "task", max_steps=1,
     )
     assert result == "plain completion"
+
+
+def test_agent_injects_final_step_terminal_reminder():
+    calls = []
+
+    def response(name, arguments, call_id):
+        tool_call = SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=None, tool_calls=[tool_call]
+            ))], usage=None, _request_id=call_id,
+        )
+
+    responses = [
+        response("read_file", {"path": "sample.py"}, "read"),
+        response("plan_finish", {
+            "goal": "fix", "affected_files": ["sample.py"], "steps": ["edit"],
+            "risks": [], "allowed_commands": [],
+        }, "plan"),
+    ]
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    client = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(create=create)
+    ))
+    result, _ = run_agent(
+        client, "system", build_tool_registry("read_file", "plan_finish"),
+        "task", max_steps=2, execute_tool=lambda name, args: "source",
+        final_step_prompt="submit the plan now",
+    )
+    assert result["goal"] == "fix"
+    assert any(message.get("content") == "submit the plan now"
+               for message in calls[1]["messages"] if isinstance(message, dict))
 
 
 def test_benchmark_write_allowlist_protects_public_tests(tmpdir):

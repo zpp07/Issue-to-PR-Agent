@@ -148,3 +148,12 @@ receives the approved plan but has no search tool, so its budget is reserved for
 confirming exact code, editing and testing. Results include the strategy and
 phase-tagged traces, keeping comparisons separate from the original `single`
 baseline.
+
+The first Hydra-1791 `plan_execute` smoke stopped in planning after 10 steps:
+it found and read the correct implementation but never called `plan_finish`.
+This cost 60,914 tokens (estimated RMB 0.1274) and did not start execution.
+The trace exposed a second tooling mismatch: bounded reads could return more
+than the Agent loop's old 2,000-character tool-output limit. The limits are now
+aligned at 12,000 characters/bytes, whole-file reads above that size require an
+explicit line range, and the Planner receives a final-step instruction that
+requires `plan_finish` instead of another read/search.

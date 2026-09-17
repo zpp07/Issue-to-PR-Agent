@@ -15,7 +15,8 @@ import subprocess
 
 # ---------- Phase 1 可靠性：上限与超时 ----------
 MAX_FILE_BYTES = 200 * 1024     # 读/写文件大小上限（200KB），防止超大文件塞爆上下文
-MAX_READ_LINES = 400            # 单次分段读取上限，避免大文件淹没上下文
+MAX_WHOLE_FILE_BYTES = 12 * 1024  # 整体读取需能完整进入 Agent 工具输出
+MAX_READ_LINES = 200            # 单次分段读取上限，避免大文件淹没上下文
 MAX_COMMAND_OUTPUT = 4000       # 命令输出截断长度
 COMMAND_TIMEOUT = 30            # 命令默认超时（秒），防止挂起命令卡死 agent
 
@@ -36,8 +37,8 @@ def read_file(path, start_line=None, end_line=None):
         size = os.path.getsize(path)
     except OSError as e:
         return f"读取失败：{e}"
-    if not ranged and size > MAX_FILE_BYTES:
-        return (f"文件过大（{size} 字节，上限 {MAX_FILE_BYTES}），拒绝整体读取。"
+    if not ranged and size > MAX_WHOLE_FILE_BYTES:
+        return (f"文件过大（{size} 字节，整体读取上限 {MAX_WHOLE_FILE_BYTES}），拒绝整体读取。"
                 "请使用 start_line/end_line 分段读取。")
     try:
         with open(path, "r", encoding="utf-8") as f:
