@@ -8,12 +8,16 @@ from typing import Any
 
 from core.agent import run_agent
 from core.policy import CommandPolicy
+from core.search import build_code_search
 from core.tools import build_tool_registry, make_executor
 from core.workflow import IssueToPRWorkflow, TaskContext
 from coder_reviewer import multi_agent_review
 
-PLANNER_TOOLS = build_tool_registry("read_file", "plan_finish")
+PLANNER_TOOLS = build_tool_registry("search_code", "read_file", "plan_finish")
+SEARCH_CODER_TOOLS = build_tool_registry("search_code", "read_file", "write_file", "run_command", "finish")
+SEARCH_REVIEWER_TOOLS = build_tool_registry("search_code", "read_file", "review_finish")
 PLANNER_PROMPT = """你是 Python 项目的变更规划员。先阅读与 issue 相关的文件，
+优先使用 search_code 找到符号、调用方、测试和文档契约，再用 read_file 精读证据。
 只做计划，绝不修改代码或运行命令。最后必须调用 plan_finish，给出：目标、可能受影响
 文件、可验证的步骤、风险和拟执行的 argv 命令。允许命令只限于：
 ["python", "-m", "pytest", "-q"]、["pytest", "-q"]、["ruff", "check", "."]、
@@ -55,8 +59,11 @@ class IssueToPRService:
         if task["status"] not in {"created", "plan_rejected"}:
             raise RuntimeError(f"任务状态 {task['status']} 不能重新生成计划")
         result, _ = run_agent(
-            self.client, PLANNER_PROMPT, PLANNER_TOOLS, task["issue"], model=self.model,
-            execute_tool=make_executor(task["workspace_path"]), max_steps=8,
+            self.client, PLANNER_PROMPT, PLANNER_TOOLS,
+            self._task_with_memory(task_id, task["issue"]), model=self.model,
+            execute_tool=make_executor(
+                task["workspace_path"], code_search=build_code_search(task["workspace_path"]),
+            ), max_steps=8,
         )
         if isinstance(result, dict) and result.get("retryable"):
             self.workflow.store.event(task_id, "planning_failed", {"error": result.get("result")})
@@ -72,10 +79,15 @@ class IssueToPRService:
         if workspace not in target.parents or not target.is_file():
             raise ValueError("target_file 必须是任务工作区内的现有文件")
         command_runner = self.sandbox.command_runner(workspace) if self.sandbox else None
-        executor = self.workflow.executor_for(task_id, target.parent, command_runner=command_runner)
+        code_search = build_code_search(workspace)
+        executor = self.workflow.executor_for(
+            task_id, workspace, command_runner=command_runner, code_search=code_search,
+        )
         passed, issues, rounds, usage = multi_agent_review(
-            self.client, str(target), task=task["issue"], max_rounds=max_rounds,
-            model=self.model, verbose=False, executor=executor,
+            self.client, str(target), task=self._task_with_memory(task_id, task["issue"]),
+            max_rounds=max_rounds,
+            model=self.model, verbose=False, executor=executor, workspace=workspace,
+            coder_tools=SEARCH_CODER_TOOLS, reviewer_tools=SEARCH_REVIEWER_TOOLS,
         )
         # Prefer the conventional target-specific test.  It prevents unrelated
         # benchmark fixtures with duplicate names from poisoning independent
@@ -104,3 +116,7 @@ class IssueToPRService:
                   "tokens": usage.total_tokens, "tests_exit_code": test_code,
                   "test_argv": test_argv}
         return self.workflow.record_execution(task_id, test_report, review)
+
+    def _task_with_memory(self, task_id: str, task: str) -> str:
+        memory = self.workflow.memory.render_context(task_id)
+        return task if not memory else f"{task}\n\n{memory}"

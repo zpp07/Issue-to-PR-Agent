@@ -1,4 +1,4 @@
-"""Optional FastAPI façade for the local single-user Phase-2 workflow.
+"""Optional FastAPI façade for the local single-user Issue-to-PR workflow.
 
 Run after installing project dependencies:
     uvicorn service_api:app --reload
@@ -46,7 +46,13 @@ class ExecuteRequest(BaseModel):
     max_rounds: int = 3
 
 
-app = FastAPI(title="Local Issue-to-PR Agent", version="0.2.0")
+class SourcedFactRequest(BaseModel):
+    statement: str
+    source_path: str
+    evidence: str
+
+
+app = FastAPI(title="Local Issue-to-PR Agent", version="0.5.0")
 
 
 def service() -> IssueToPRService:
@@ -108,3 +114,26 @@ def get_task(task_id: str):
         return {"task": workflow.store.task(task_id), "events": workflow.store.events(task_id)}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/tasks/{task_id}/memories")
+def get_memories(task_id: str, kind: str | None = None, limit: int = 100):
+    try:
+        kinds = [kind] if kind else None
+        return {"memories": workflow.memory.list(task_id, kinds=kinds, limit=limit)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/tasks/{task_id}/memories/facts")
+def remember_fact(task_id: str, request: SourcedFactRequest):
+    try:
+        return workflow.memory.remember_sourced_fact(
+            task_id, request.statement, request.source_path, request.evidence,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

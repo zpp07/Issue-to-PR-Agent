@@ -1,4 +1,4 @@
-"""Phase-2 state machine for a single-user local Issue-to-PR workflow."""
+"""State machine for a single-user local Issue-to-PR workflow."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ import subprocess
 from typing import Any
 
 from core.audit import TaskStore
+from core.memory import TaskMemory
 from core.policy import CommandPolicy
 from core.tools import make_executor
 
@@ -44,6 +45,7 @@ class IssueToPRWorkflow:
         self.workspace_root = Path(workspace_root).resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.policy = CommandPolicy()
+        self.memory = TaskMemory(store)
 
     def create_task(self, repo_path: str | Path, issue: str) -> TaskContext:
         repo = Path(repo_path).resolve()
@@ -84,11 +86,14 @@ class IssueToPRWorkflow:
         plan = self.store.latest_artifact(task_id, "plan")
         if plan["sha256"] != plan_hash:
             raise ValueError("计划哈希不匹配；请审批当前版本")
-        self.store.approve(task_id, "plan", plan_hash, decision, actor, reason)
+        approval = self.store.approve(task_id, "plan", plan_hash, decision, actor, reason)
         self.store.set_status(task_id, "ready_to_execute" if decision == "approved" else "plan_rejected")
+        self.memory.capture_approval(approval)
+        if decision == "approved":
+            self.memory.capture_approved_plan(task_id)
 
     def executor_for(self, task_id: str, workdir: str | Path | None = None,
-                     command_runner=None):
+                     command_runner=None, code_search=None, writable_files=None):
         task = self.store.task(task_id)
         if task["status"] != "ready_to_execute":
             raise RuntimeError("任务尚未获得计划审批")
@@ -111,6 +116,7 @@ class IssueToPRWorkflow:
         return make_executor(
             execution_workdir, policy=self.policy,
             approval_callback=command_approval, command_runner=command_runner,
+            code_search=code_search, writable_files=writable_files,
         )
 
     def approve_command(self, task_id: str, argv: list[str], actor: str, decision: str, reason: str | None = None) -> str:
@@ -139,6 +145,12 @@ class IssueToPRWorkflow:
             }
             self.store.set_status(task_id, "validation_failed")
             self.store.event(task_id, "validation_failed", failure)
+            self.memory.capture_failure(
+                task_id,
+                f"独立验证失败：reviewer_passed={failure['reviewer_passed']}，"
+                f"tests_exit_code={failure['tests_exit_code']}",
+                self.store.latest_artifact(task_id, "test_report"),
+            )
             return {"diff_sha256": diff_hash, "test_report_sha256": test_hash,
                     "validation": "failed"}
         review_hash = _digest(report)
@@ -159,5 +171,6 @@ class IssueToPRWorkflow:
         review = self.store.latest_artifact(task_id, "diff_review")
         if review["sha256"] != review_hash:
             raise ValueError("diff 审批对象已过期；请审批最新 diff/test 组合")
-        self.store.approve(task_id, "diff", review_hash, decision, actor, reason)
+        approval = self.store.approve(task_id, "diff", review_hash, decision, actor, reason)
         self.store.set_status(task_id, "approved_for_pr" if decision == "approved" else "diff_rejected")
+        self.memory.capture_approval(approval)

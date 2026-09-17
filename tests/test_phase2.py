@@ -88,6 +88,8 @@ def test_failed_independent_validation_never_requests_diff_approval(tmpdir):
     outcome = workflow.record_execution(context.task_id, "no tests ran", {"passed": True, "tests_exit_code": 5})
     assert outcome["validation"] == "failed"
     assert store.task(context.task_id)["status"] == "validation_failed"
+    memories = workflow.memory.list(context.task_id)
+    assert any(record["kind"] == "failure" for record in memories)
     subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(context.workspace)],
                    check=True, capture_output=True)
 

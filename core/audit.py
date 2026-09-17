@@ -59,6 +59,12 @@ class TaskStore:
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
                 event_type TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL,
+                content TEXT NOT NULL, source_type TEXT NOT NULL, source_ref TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL,
+                UNIQUE(task_id, kind, content, source_ref, source_sha256)
+            );
             """)
 
     def create_task(self, issue: str, repo_path: str, workspace_path: str, base_commit: str) -> str:
@@ -129,4 +135,47 @@ class TaskStore:
     def events(self, task_id: str) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM audit_events WHERE task_id=? ORDER BY sequence", (task_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_memory(self, task_id: str, kind: str, content: str, source_type: str,
+                   source_ref: str, source_sha256: str,
+                   metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Insert an immutable, provenance-bearing memory or return its existing row."""
+        memory_id = uuid.uuid4().hex
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (memory_id, task_id, kind, content, source_type, source_ref,
+                 source_sha256, metadata_json, _now()),
+            )
+            row = conn.execute(
+                "SELECT * FROM memories WHERE task_id=? AND kind=? AND content=? "
+                "AND source_ref=? AND source_sha256=?",
+                (task_id, kind, content, source_ref, source_sha256),
+            ).fetchone()
+        result = dict(row)
+        if cursor.rowcount:
+            self.event(task_id, "memory_recorded", {
+                "memory_id": result["id"], "kind": kind, "source_type": source_type,
+                "source_ref": source_ref, "source_sha256": source_sha256,
+            })
+        return result
+
+    def memories(self, task_id: str, kinds: list[str] | None = None,
+                 limit: int = 100) -> list[dict[str, Any]]:
+        self.task(task_id)  # consistent unknown-task behavior
+        limit = max(1, min(int(limit), 500))
+        parameters: list[Any] = [task_id]
+        where = "task_id=?"
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            where += f" AND kind IN ({placeholders})"
+            parameters.extend(kinds)
+        parameters.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM memories WHERE {where} ORDER BY created_at, id LIMIT ?",
+                parameters,
+            ).fetchall()
         return [dict(row) for row in rows]

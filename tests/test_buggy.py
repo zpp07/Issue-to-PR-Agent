@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-import buggy  # noqa: E402
 from buggy import add, add_decimal  # noqa: E402
 
 

@@ -1,4 +1,4 @@
-"""Dependency-free HTTP façade for the local Phase-2 workflow.
+"""Dependency-free HTTP façade for the local Issue-to-PR workflow.
 
 Run: python service_http.py
 It is intentionally local-only (127.0.0.1) and has no authentication because
@@ -51,6 +51,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 2 and parts[0] == "tasks":
                 task_id = parts[1]
                 return self._reply(200, {"task": store.task(task_id), "events": store.events(task_id)})
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "memories":
+                return self._reply(200, {"memories": workflow.memory.list(parts[1])})
             self._reply(404, {"detail": "not found"})
         except KeyError as exc:
             self._reply(404, {"detail": str(exc)})
@@ -76,6 +78,11 @@ class Handler(BaseHTTPRequestHandler):
                 workflow.approve_diff(parts[1], body["subject_hash"], body.get("actor", "local-user"),
                                       body["decision"], body.get("reason"))
                 return self._reply(200, store.task(parts[1]))
+            if len(parts) == 4 and parts[0] == "tasks" and parts[2:] == ["memories", "facts"]:
+                result = workflow.memory.remember_sourced_fact(
+                    parts[1], body["statement"], body["source_path"], body["evidence"],
+                )
+                return self._reply(201, result)
             self._reply(404, {"detail": "not found"})
         except PlanningUnavailable as exc:
             self._reply(503, {"detail": str(exc), "retryable": True})

@@ -44,7 +44,7 @@ Issue/需求 → 代码库检索定位 → 结构化计划 → 受限执行 → 
 - `core/tools.py`：`run_command` 加 timeout + 输出截断；`read/write_file` 加 size 上限 + try/except
 - `core/agent.py`：启用 logger + request_id + 工具输出截断 + token/step/成本预算 + LLM 异常分类
 
-当时的全局软肋（历史基线）：`run_command` 仍 `shell=True`；无 pyproject/lockfile；无单元测试；无结构化 trace；无 diff 审批/检索/任务记忆/hidden-test benchmark/git-PR/Planner。Phase 1–3 已解决其中大部分，保留此段用于说明改造起点。
+当时的全局软肋（历史基线）：`run_command` 仍 `shell=True`；无 pyproject/lockfile；无单元测试；无结构化 trace；无 diff 审批/检索/任务记忆/hidden-test benchmark/git-PR/Planner。Phase 1–5 已解决其中大部分，保留此段用于说明改造起点。
 
 ---
 
@@ -94,18 +94,30 @@ reviewer 21/22（9,725 / ¥0.0264），planner 21/22（11,271 / ¥0.0321）；�
 完成标志：已获得可复现数据，可回答「当前任务上独立 reviewer 不值额外成本」，并能说明
 benchmark 校准、失败案例和独立 verifier 的必要性。
 
-### Phase 4 · 代码库检索 + 第二轮消融
+### Phase 4 · 代码库检索 + 第二轮消融（已完成并实测）
 
 - AST 结构切块 + BM25 + 向量召回 + bge-reranker（`core/search.py`）
 - 接进 coder 的 toolset
 - **只在「跨文件 / 需读文档」子集上比较**（避免总指标被简单单文件 bug 稀释）
 
-完成标志：面试能甩「检索让跨文件任务成功率 X%→Y%，token 省 Z%」。
+当前实现：`core/search.py` 提供 AST/文档结构切块、BM25、hashing vector、词项重排，
+并提供可选 Sentence Transformers + BGE CrossEncoder 后端；`search_code` 已接入 Planner、
+Coder、Reviewer。`benchmark/harder_*` 提供 6 个跨文件/文档契约 case。
 
-### Phase 5 · 任务记忆
+受控单次检索的真实结果：browse 与 hybrid 都是 6/6；hybrid 平均 token 6,978 vs
+6,624（+5.3%），耗时 35.12s vs 37.62s（-6.6%），文件读取 34 vs 37（-8.1%）。
+Agent 自由调用 search 的 pilot 更差（10,545 vs 7,345 tokens），因此当前结论是：
+**小仓库未证明检索提升成功率或 token 效率；系统级单次检索优于自由反复搜索。**
+这替代了原先预设的“X%→Y%”宣传目标。
+
+### Phase 5 · 任务记忆（已完成）
 
 - 只持久化**有来源的事实、测试命令、失败记录、已批准决策**
 - 模型自由推断**不能**成为长期事实
+
+当前实现：`core/memory.py` + SQLite `memories` 表。文件事实必须是来源中的逐字证据；
+哈希变化后自动 stale 且不再进入上下文。测试命令、失败记录和人工决策只从已批准 artifact
+或 approval 自动派生。FastAPI 与标准库 HTTP 服务均提供查询和 sourced-fact 入口。
 
 ### Phase 6 · git/PR + 收尾
 
@@ -117,13 +129,13 @@ benchmark 校准、失败案例和独立 verifier 的必要性。
 
 ---
 
-## 4. 下一步（Phase 4）
+## 4. 下一步（Phase 6）
 
-1. 新增跨文件、需读文档的 harder benchmark suite
-2. 实现 AST/结构化切块 + BM25 基线
-3. 再加入向量召回与 reranker
-4. 在 harder suite 上做无检索/有检索消融
-5. 补多随机种子与置信区间，避免单次运行结论过强
+1. 对 commit、push、PR body 和远程 PR 分别建立哈希审批对象
+2. 使用最小 GitHub token scope，所有远程写操作写入 append-only audit
+3. 生成可复核 PR body（issue、计划、测试、风险、diff 摘要）
+4. 写技术报告：架构、威胁模型、两轮 benchmark、负面结果、成本
+5. 扩大 harder suite 并补多随机种子/置信区间，避免单次运行结论过强
 
 ---
 

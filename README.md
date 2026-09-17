@@ -98,15 +98,53 @@ token 成本，成功率反而略低。下一轮应在跨文件、需要检索�
 这是单次运行的工程基线，不是带置信区间的统计结论；原始 JSONL 和完整失败明细见
 `benchmark/results.jsonl` 与 `benchmark/results.md`。
 
+## Phase 4：代码检索与跨文件消融
+
+`core/search.py` 实现 Python AST / 文档标题切块、BM25、向量召回和候选重排。
+默认后端是完全离线、确定性的 hashing vector + lexical reranker；安装 `.[rag]` 并设置
+`AGENT_DENSE_MODEL`、`AGENT_RERANKER_MODEL` 后，可切换 Sentence Transformers 与
+BGE CrossEncoder。`search_code` 已接入 Planner、Coder 和 Reviewer，并返回文件、行号、
+symbol 和分项分数。
+
+`benchmark/harder_catalog.py` 新增 6 个多文件、需读文档/配置契约的 hidden-test case。
+受控消融固定只预检索一次并按文件去重，避免把“检索质量”和“Agent 反复搜索策略”混在一起：
+
+| 方法 | Hidden pass | 平均 tokens | 平均耗时 | 文件读取次数 |
+|---|---:|---:|---:|---:|
+| browse | 6/6 (100%) | 6,624 | 37.62s | 37 |
+| hybrid（单次受控检索） | 6/6 (100%) | 6,978 | 35.12s | 34 |
+
+结论是成功率 `100% → 100%`，hybrid token **增加 5.3%**，但耗时下降 6.6%、文件读取
+下降 8.1%。此前让 Agent 自由调用检索的 pilot 更差（平均 10,545 tokens vs 7,345），
+因此保留两组原始数据作为负面结果：小仓库尚未证明检索的成功率/成本收益，受控检索比
+自由反复搜索更合理。下一轮需要更大仓库和多随机种子，不能把当前结果包装成提升。
+
+```powershell
+python -m benchmark.harder_run --cases all --methods browse,hybrid `
+  --output benchmark/harder_controlled_results.jsonl
+```
+
+## Phase 5：有来源的任务记忆
+
+`core/memory.py` 只允许四类持久化内容：逐字文件事实、已批准计划中的测试命令、测试失败、
+人工审批决策。每条 SQLite 记录都带 `source_type`、`source_ref` 和 `source_sha256`：
+
+- 文件事实必须逐字等于工作区中的证据，模型摘要或自由推断会被拒绝；
+- 文件哈希变化后，旧事实标记为 `stale`，不再注入 Agent 上下文；
+- 测试命令、失败和决策只由已批准 artifact / approval 自动派生；
+- REST 接口可以查询记忆或提交带逐字证据的文件事实，没有“保存任意模型总结”的接口。
+
+这不是聊天记录归档，而是一个小型、可审计的 provenance memory。
+
 ## 文件结构
 
 ```
 multi-agent/
-├── core/                   # Agent loop、tools、policy、audit、workflow、Docker sandbox
-├── benchmark/              # 22-case hidden-test benchmark + 正式结果
+├── core/                   # Agent、检索、来源记忆、审批、审计与 Docker sandbox
+├── benchmark/              # Phase 3 基线 + Phase 4 harder-suite 消融
 ├── docker/                 # 隔离执行镜像
-├── docs/                   # 路线图与 Phase 1–3 交接文档
-├── tests/                  # Phase 2/3 主回归测试
+├── docs/                   # 路线图与 Phase 1–5 交接文档
+├── tests/                  # Phase 2–5 主回归测试
 ├── pyproject.toml          # 可安装项目与依赖声明
 ├── service_http.py         # 标准库本地 REST 服务
 ├── service_api.py          # 可选 FastAPI 服务
@@ -239,5 +277,7 @@ python experiment.py --cases case01_add --methods mreview,self
 
 - [x] 扩充到 22 个公开/隐藏测试分离的确定性用例
 - [x] 加入 Planner，并完成 single/reviewer/planner 的 22×3 基线
-- [ ] 新增跨文件、需检索、契约更复杂的 harder suite
-- [ ] 用正式 dashboard 和失败案例写一页 mini-paper / 技术博客
+- [x] 新增跨文件、需检索、契约更复杂的 harder suite
+- [x] 完成 browse / hybrid 第二轮消融并保留负面结果
+- [x] 增加有来源、可失效的任务记忆
+- [ ] Phase 6：受审批的 commit / PR body / GitHub PR 创建与技术报告
