@@ -46,7 +46,7 @@ small repository.
 
 The synthetic result above is now being checked against real repository
 snapshots. See [`real/README.md`](real/README.md) for provenance, validation
-states, exact reproduction commands and the current six-case audit. The key
-finding so far is intentionally negative: top-10 hybrid retrieval finds the
-reference production file in only 1/6 audited real tasks, so retrieval work
+states, exact reproduction commands and the frozen six-case scored manifest.
+The key finding so far is intentionally negative: top-10 hybrid retrieval finds
+the reference production file in only 1/6 verified real tasks, so retrieval work
 must be guided by this set rather than by the already-solved toy suite.

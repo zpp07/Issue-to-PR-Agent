@@ -20,10 +20,10 @@ Work is paused on branch `phase4.5-real-benchmark`.
 
 Patch application now sets `GIT_CEILING_DIRECTORIES` to the parent of each
 snapshot and uses an explicit temporary patch file. The nested-repository
-regression test passes, and all six snapshots were re-audited with real patch
+regression test passes, and all seven snapshots were audited with real patch
 application.
 
-Four tasks are now `tests_verified` in `test_audit.jsonl`:
+Six tasks are now `tests_verified` in `test_audit.jsonl`:
 
 - `facebookresearch__hydra-1791`: four regression failures before the fix;
   52 selected tests pass after the fix.
@@ -33,10 +33,15 @@ Four tasks are now `tests_verified` in `test_audit.jsonl`:
   tests pass after the fix.
 - `iterative__dvc-4185`: seven regression failures before the fix; 12 selected
   tests pass after the fix.
+- `pydantic__pydantic-8977`: four regression failures before the fix; 288
+  selected tests pass after the fix.
+- `dask__dask-7894`: five regression failures before the fix; 26 selected
+  tests pass after the fix.
 
 ## First action when resuming
 
-Build a pinned Pydantic environment and verify `pydantic__pydantic-8977`.
-Select Dask (or another dependency-light task) instead of MONAI for the sixth
-case. Keep environment construction network-enabled, but all verification and
-later agent runs networkless and read-only.
+Phase 4.5's six-task verification gate is complete and the scored set is frozen
+in `verified_manifest.json` (excluding the unverified MONAI reserve). The next
+session should run the current agent on it with multiple seeds, and only then
+use those failures to scope Phase 6. Keep environment construction
+network-enabled, but all verification and agent runs networkless and read-only.

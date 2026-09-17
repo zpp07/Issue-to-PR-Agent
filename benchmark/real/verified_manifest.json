@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "status": "tests_verified",
+  "purpose": "Frozen Phase 4.5 scored set. Reference patches remain evaluator-only.",
+  "cases": [
+    {
+      "instance_id": "iterative__dvc-4124",
+      "image": "issue-to-pr-dvc:phase45"
+    },
+    {
+      "instance_id": "facebookresearch__hydra-1791",
+      "image": "issue-to-pr-hydra:phase45"
+    },
+    {
+      "instance_id": "iterative__dvc-4185",
+      "image": "issue-to-pr-dvc:phase45"
+    },
+    {
+      "instance_id": "pydantic__pydantic-8977",
+      "image": "issue-to-pr-pydantic:phase45"
+    },
+    {
+      "instance_id": "facebookresearch__hydra-1006",
+      "image": "issue-to-pr-hydra:phase45"
+    },
+    {
+      "instance_id": "dask__dask-7894",
+      "image": "issue-to-pr-dask:phase45"
+    }
+  ],
+  "reserve_cases": [
+    {
+      "instance_id": "Project-MONAI__MONAI-3326",
+      "reason": "Snapshot and patches verified; test environment intentionally deferred."
+    }
+  ]
+}

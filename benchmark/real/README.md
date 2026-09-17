@@ -16,7 +16,8 @@ The deterministic metadata filter currently accepts 177 rows and rejects
 tasks that have no regression-test patch, no fail-to-pass tests, an unsuitable
 issue length, or an overly large/non-Python production patch. It then selects
 at most two tasks from one repository. This produces 12 curator candidates in
-`selected.jsonl`; the first six have been snapshot-audited.
+`selected.jsonl`; seven have been snapshot-audited and six form the frozen
+scored set in `verified_manifest.json`.
 
 ## Validation states
 
@@ -42,15 +43,18 @@ curated execution candidate, not a validated benchmark task.
 | `facebookresearch__hydra-1791` | 1,122 | patch verified | no | verified: 4 fail before, 52 pass after |
 | `iterative__dvc-4185` | 374 | patch verified | no | verified: 7 fail before, 12 pass after |
 | `Project-MONAI__MONAI-3326` | 777 | patch verified | yes | not run |
-| `pydantic__pydantic-8977` | 401 | patch verified | no | not run |
+| `pydantic__pydantic-8977` | 401 | patch verified | no | verified: 4 fail before, 288 pass after |
 | `facebookresearch__hydra-1006` | 723 | patch verified | no | verified: 6 fail before, 35 pass after |
+| `dask__dask-7894` | 338 | patch verified | yes | verified: 5 fail before, 26 pass after |
 
-All six exact snapshots and patches are structurally valid. Two Hydra and two
-DVC tasks also pass the full pre-fix/post-fix transition in networkless
-containers. The current
-dependency-free hybrid retriever recalls the edited production file for only
-1/6 tasks at top 10. This is a useful negative result: the earlier six-task
-synthetic suite was too small/easy to establish retrieval quality.
+All seven audited exact snapshots and patches are structurally valid. Six tasks
+from Hydra, DVC, Pydantic and Dask pass the full pre-fix/post-fix transition in
+networkless containers; MONAI remains a structurally valid reserve task. The
+current dependency-free hybrid retriever recalls the edited production file
+for only 1/6 verified tasks at top 10. The reserve MONAI case is also a
+retrieval hit, but is not included in the scored denominator. This is a useful
+negative result: the earlier six-task synthetic suite was too small/easy to
+establish retrieval quality.
 
 For every audited case, `snapshot_audit.jsonl` also contains a 40-file context
 pack: top retrieval results followed by stable distractors. Gold and test file
@@ -67,7 +71,7 @@ python -m benchmark.import_swegym `
   --limit 12 --max-per-repo 2
 ```
 
-Download exact snapshots and audit the first six:
+Download exact snapshots and audit the default first six:
 
 ```powershell
 python -m benchmark.real_snapshot `
@@ -77,15 +81,17 @@ python -m benchmark.real_snapshot `
 
 Downloaded archives and worktrees live under `.local/real_benchmark/` and are
 git-ignored. The normalized candidate manifest and audit evidence are tracked.
+Use `--instances id1,id2` to audit additional selected cases without replacing
+existing audit rows.
 
-## Remaining gate before scored runs
+## Scored-run gate
 
 The official prebuilt SWE-Gym images were not anonymously pullable from the
 documented registry during this run. A pinned Hydra environment is therefore
-provided in `docker/hydra.Dockerfile`; `docker/dvc.Dockerfile` pins the legacy
-DVC dependency set. Together they have verified four tasks with network
-disabled during execution. The next cost-effective targets are Pydantic and
-Dask; MONAI is deferred because a credible environment requires a much larger
-Torch image. A task moves to `tests_verified` only after the pre-fix/post-fix
-transition is recorded. Phase 6 should preferably wait until six tasks clear
-this gate.
+provided in `docker/hydra.Dockerfile`; the DVC, Pydantic and Dask Dockerfiles
+pin their corresponding historical dependency sets. Together they verify six
+tasks with network disabled during execution. MONAI is deferred because a
+credible environment requires a much larger Torch image. A task moves to
+`tests_verified` only after the pre-fix/post-fix transition is recorded. The
+six-task Phase 4.5 gate is now complete; Phase 6 can proceed without using the
+earlier toy suite as its only quality signal.

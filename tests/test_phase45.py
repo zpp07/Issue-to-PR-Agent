@@ -1,4 +1,5 @@
 from benchmark.import_swegym import normalize, summary
+import json
 from pathlib import Path
 import subprocess
 import zipfile
@@ -6,7 +7,13 @@ import zipfile
 import pytest
 
 from benchmark.real_cases import CandidatePolicy, RealCase, patch_files, select_cases
-from benchmark.real_snapshot import audit_snapshot, extract_archive, validate_identity
+from benchmark.real_snapshot import (
+    SnapshotAudit,
+    audit_snapshot,
+    extract_archive,
+    validate_identity,
+    write_audits,
+)
 from benchmark.real_verify import _apply, expected_pytest_failure, normalize_pytest_target
 from core.sandbox import SandboxResult
 
@@ -104,6 +111,38 @@ def test_snapshot_archive_rejects_zip_slip(tmpdir):
         output.writestr("repo-abc/../escaped.py", "bad")
     with pytest.raises(ValueError):
         extract_archive(archive, tmp_path / "snapshot")
+
+
+def test_snapshot_archive_skips_symlinks_without_creating_them(tmpdir):
+    tmp_path = Path(str(tmpdir))
+    archive = tmp_path / "repo.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("repo-abc/pkg/service.py", "return 'old'\n")
+        link = zipfile.ZipInfo("repo-abc/pkg/service-link.py")
+        link.create_system = 3
+        link.external_attr = 0o120777 << 16
+        output.writestr(link, "service.py")
+    destination = extract_archive(archive, tmp_path / "snapshot")
+    assert (destination / "pkg/service.py").is_file()
+    assert not (destination / "pkg/service-link.py").exists()
+
+
+def test_snapshot_audit_merge_replaces_and_appends_by_instance(tmpdir):
+    def audit(instance_id, file_count):
+        return SnapshotAudit(
+            instance_id=instance_id, repo="owner/repo", base_commit="abc1234",
+            snapshot_state="patch_verified", searchable_file_count=file_count,
+            python_file_count=file_count, production_files_exist=True,
+            gold_patch_applies=True, test_patch_applies=True, test_state="not_run",
+            retrieval_files=(), context_files=(), gold_file_recall=0.0, reasons=(),
+        )
+
+    output = Path(str(tmpdir)) / "audit.jsonl"
+    write_audits([audit("case-a", 1), audit("case-b", 2)], output)
+    write_audits([audit("case-b", 20), audit("case-c", 3)], output, merge=True)
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["instance_id"] for row in rows] == ["case-a", "case-b", "case-c"]
+    assert [row["searchable_file_count"] for row in rows] == [1, 20, 3]
 
 
 def test_snapshot_audit_marks_patch_verified_but_tests_not_run(tmpdir):

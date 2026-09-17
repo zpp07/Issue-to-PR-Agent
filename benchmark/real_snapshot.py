@@ -56,7 +56,7 @@ def snapshot_directory(cache_root: str | Path, case: RealCase) -> Path:
 
 
 def _safe_members(archive: zipfile.ZipFile):
-    """Yield (member, stripped relative path) while rejecting zip-slip/symlinks."""
+    """Yield safe regular members, stripping the root and skipping symlinks."""
     files = [member for member in archive.infolist() if not member.is_dir()]
     roots = {PurePosixPath(member.filename).parts[0] for member in files}
     if len(roots) != 1:
@@ -71,7 +71,10 @@ def _safe_members(archive: zipfile.ZipFile):
             raise ValueError(f"unsafe archive member: {member.filename!r}")
         unix_mode = member.external_attr >> 16
         if (unix_mode & 0o170000) == 0o120000:
-            raise ValueError(f"symbolic link is not allowed: {member.filename!r}")
+            # Repository archives may contain legitimate relative symlinks.
+            # Do not create them on the host; benchmark production-file and
+            # patch checks below will reject a case if a required path was one.
+            continue
         yield member, relative
 
 
@@ -265,10 +268,20 @@ def audit_snapshot(case: RealCase, root: str | Path,
     )
 
 
-def write_audits(audits: list[SnapshotAudit], path: str | Path) -> None:
+def write_audits(audits: list[SnapshotAudit], path: str | Path,
+                 merge: bool = False) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    content = "".join(json.dumps(audit.to_dict(), ensure_ascii=False) + "\n" for audit in audits)
+    rows = []
+    if merge and destination.is_file():
+        rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+    replacements = {audit.instance_id: audit.to_dict() for audit in audits}
+    rows = [replacements.pop(row["instance_id"], row) for row in rows]
+    rows.extend(replacements.values())
+    if not merge:
+        rows = [audit.to_dict() for audit in audits]
+    content = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
     destination.write_text(content, encoding="utf-8")
 
 
@@ -279,13 +292,25 @@ def main() -> None:
     parser.add_argument("--output", default="benchmark/real/snapshot_audit.jsonl")
     parser.add_argument("--proxy")
     parser.add_argument("--limit", type=int, default=6)
+    parser.add_argument("--instances", help="optional comma-separated instance ids")
     parser.add_argument("--context-files", type=int, default=40)
     args = parser.parse_args()
     if args.limit < 1 or not 15 <= args.context_files <= 50:
         parser.error("limit must be positive; context-files must be between 15 and 50")
 
+    cases = read_jsonl(args.cases)
+    if args.instances:
+        requested = [item.strip() for item in args.instances.split(",") if item.strip()]
+        by_id = {case.instance_id: case for case in cases}
+        missing = [item for item in requested if item not in by_id]
+        if missing:
+            parser.error(f"unknown instance ids: {', '.join(missing)}")
+        cases = [by_id[item] for item in requested]
+    else:
+        cases = cases[:args.limit]
+
     audits = []
-    for case in read_jsonl(args.cases)[:args.limit]:
+    for case in cases:
         print(f"preparing {case.instance_id} ...", flush=True)
         root = download_snapshot(case, args.cache_root, args.proxy)
         audit = audit_snapshot(case, root, args.context_files)
@@ -296,7 +321,7 @@ def main() -> None:
             f"reasons={list(audit.reasons)}",
             flush=True,
         )
-    write_audits(audits, args.output)
+    write_audits(audits, args.output, merge=bool(args.instances))
 
 
 if __name__ == "__main__":

@@ -117,6 +117,10 @@ def _pytest_command(case: RealCase, root: Path,
         # excluding that conftest avoids pulling cloud SDKs into the image.
         test_parent = Path(case.fail_to_pass[0].split("::", 1)[0]).parent.as_posix()
         options.append(f"--confcutdir={test_parent}")
+    if case.repo == "pydantic/pydantic":
+        # The repository-wide addopts require benchmark plugins unrelated to
+        # these selected correctness tests.
+        options.extend(["-o", "addopts="])
     command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider",
                *options, *targets]
     return command, len(pass_targets)
