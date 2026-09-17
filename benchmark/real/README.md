@@ -38,15 +38,16 @@ curated execution candidate, not a validated benchmark task.
 
 | Instance | Repository files | Patch state | Top-10 retrieval finds gold file | Test state |
 |---|---:|---|---:|---|
-| `iterative__dvc-4124` | 372 | patch verified | no | not run |
+| `iterative__dvc-4124` | 372 | patch verified | no | verified: 6 fail before, 11 pass after |
 | `facebookresearch__hydra-1791` | 1,122 | patch verified | no | verified: 4 fail before, 52 pass after |
-| `iterative__dvc-4185` | 374 | patch verified | no | not run |
+| `iterative__dvc-4185` | 374 | patch verified | no | verified: 7 fail before, 12 pass after |
 | `Project-MONAI__MONAI-3326` | 777 | patch verified | yes | not run |
 | `pydantic__pydantic-8977` | 401 | patch verified | no | not run |
 | `facebookresearch__hydra-1006` | 723 | patch verified | no | verified: 6 fail before, 35 pass after |
 
-All six exact snapshots and patches are structurally valid. Two Hydra tasks
-also pass the full pre-fix/post-fix transition in a networkless container. The current
+All six exact snapshots and patches are structurally valid. Two Hydra and two
+DVC tasks also pass the full pre-fix/post-fix transition in networkless
+containers. The current
 dependency-free hybrid retriever recalls the edited production file for only
 1/6 tasks at top 10. This is a useful negative result: the earlier six-task
 synthetic suite was too small/easy to establish retrieval quality.
@@ -81,8 +82,10 @@ git-ignored. The normalized candidate manifest and audit evidence are tracked.
 
 The official prebuilt SWE-Gym images were not anonymously pullable from the
 documented registry during this run. A pinned Hydra environment is therefore
-provided in `docker/hydra.Dockerfile`; it has verified two tasks with network
-disabled during execution. The next step is an equivalent DVC environment for
-the two selected DVC tasks. A task moves to `tests_verified` only after the
-pre-fix/post-fix transition is recorded. Phase 6 should wait until at least
-three, preferably six, tasks clear this gate.
+provided in `docker/hydra.Dockerfile`; `docker/dvc.Dockerfile` pins the legacy
+DVC dependency set. Together they have verified four tasks with network
+disabled during execution. The next cost-effective targets are Pydantic and
+Dask; MONAI is deferred because a credible environment requires a much larger
+Torch image. A task moves to `tests_verified` only after the pre-fix/post-fix
+transition is recorded. Phase 6 should preferably wait until six tasks clear
+this gate.

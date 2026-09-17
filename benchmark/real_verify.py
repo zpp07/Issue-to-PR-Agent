@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -78,11 +79,60 @@ def normalize_pytest_target(target: str) -> str:
     return f"{path}::{node.split('[', 1)[0]}"
 
 
-def _pytest_command(case: RealCase, pass_sample: int) -> list[str]:
+def _dvc_pass_targets(case: RealCase, root: Path, count: int) -> list[str]:
+    if case.instance_id == "iterative__dvc-4185":
+        return [target for target in case.pass_to_pass
+                if target.startswith("tests/unit/dependency/")][:count]
+    selected = []
+    trees = {}
+    for target in case.pass_to_pass:
+        path, node = target.split("::", 1)
+        function_name = node.split("[", 1)[0]
+        try:
+            tree = trees.setdefault(path, ast.parse((root / path).read_text(encoding="utf-8")))
+            function = next(item for item in tree.body
+                            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and item.name == function_name)
+        except (OSError, UnicodeDecodeError, SyntaxError, StopIteration, ValueError):
+            continue
+        if function.args.args:
+            continue
+        selected.append(target)
+        if len(selected) >= count:
+            break
+    return selected
+
+
+def _pytest_command(case: RealCase, root: Path,
+                    pass_sample: int) -> tuple[list[str], int]:
+    pass_targets = (_dvc_pass_targets(case, root, pass_sample)
+                    if case.repo == "iterative/dvc"
+                    else list(case.pass_to_pass[:pass_sample]))
     raw_targets = list(case.fail_to_pass)
-    raw_targets.extend(case.pass_to_pass[:pass_sample])
+    raw_targets.extend(pass_targets)
     targets = list(dict.fromkeys(normalize_pytest_target(target) for target in raw_targets))
-    return ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", *targets]
+    options = []
+    if case.repo == "iterative/dvc":
+        # The selected unit tests do not need the root remote-service fixtures;
+        # excluding that conftest avoids pulling cloud SDKs into the image.
+        test_parent = Path(case.fail_to_pass[0].split("::", 1)[0]).parent.as_posix()
+        options.append(f"--confcutdir={test_parent}")
+    command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+               *options, *targets]
+    return command, len(pass_targets)
+
+
+def _prepare_fixture_bridge(case: RealCase, workspace: Path) -> None:
+    if case.instance_id != "iterative__dvc-4185":
+        return
+    destination = workspace / "tests/unit/dependency/conftest.py"
+    if destination.exists():
+        raise RuntimeError(f"refusing to overwrite benchmark file: {destination}")
+    destination.write_text(
+        "# Evaluator-only bridge; not part of the agent workspace.\n"
+        "from tests.dir_helpers import *  # noqa: F401,F403\n",
+        encoding="utf-8",
+    )
 
 
 def verify_case(case: RealCase, cache_root: str | Path, image: str,
@@ -98,6 +148,7 @@ def verify_case(case: RealCase, cache_root: str | Path, image: str,
     try:
         shutil.copytree(source, workspace)
         _apply(workspace, case.test_patch)
+        _prepare_fixture_bridge(case, workspace)
         sandbox = DockerSandbox(
             image=image, docker_binary=docker_binary,
             limits=DockerLimits(cpus=2.0, memory="2g", pids=256, timeout=300),
@@ -120,7 +171,7 @@ def verify_case(case: RealCase, cache_root: str | Path, image: str,
                     preparation_output=preparation.output,
                     baseline_output="not run", fixed_output="not run",
                 )
-        command = _pytest_command(case, pass_sample)
+        command, selected_pass_count = _pytest_command(case, workspace, pass_sample)
         baseline = sandbox.run(
             workspace, command, read_only_workspace=True, timeout=300,
         )
@@ -139,7 +190,7 @@ def verify_case(case: RealCase, cache_root: str | Path, image: str,
             fixed_tests_passed=fixed_passed,
             test_state="tests_verified" if baseline_expected and fixed_passed else "test_failed",
             fail_to_pass_count=len(case.fail_to_pass),
-            pass_to_pass_sample_count=min(pass_sample, len(case.pass_to_pass)),
+            pass_to_pass_sample_count=selected_pass_count,
             preparation_output=preparation.output,
             baseline_output=baseline.output,
             fixed_output=fixed.output,

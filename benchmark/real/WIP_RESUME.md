@@ -23,16 +23,20 @@ snapshot and uses an explicit temporary patch file. The nested-repository
 regression test passes, and all six snapshots were re-audited with real patch
 application.
 
-Two tasks are now `tests_verified` in `test_audit.jsonl`:
+Four tasks are now `tests_verified` in `test_audit.jsonl`:
 
 - `facebookresearch__hydra-1791`: four regression failures before the fix;
   52 selected tests pass after the fix.
 - `facebookresearch__hydra-1006`: six regression failures before the fix;
   35 selected tests pass after the fix.
+- `iterative__dvc-4124`: six regression failures before the fix; 11 selected
+  tests pass after the fix.
+- `iterative__dvc-4185`: seven regression failures before the fix; 12 selected
+  tests pass after the fix.
 
 ## First action when resuming
 
-Build a pinned DVC environment and verify `iterative__dvc-4124` and
-`iterative__dvc-4185`. Then select the cheapest remaining two repositories to
-reach six verified tasks. Keep environment construction network-enabled, but
-all verification and later agent runs networkless and read-only.
+Build a pinned Pydantic environment and verify `pydantic__pydantic-8977`.
+Select Dask (or another dependency-light task) instead of MONAI for the sixth
+case. Keep environment construction network-enabled, but all verification and
+later agent runs networkless and read-only.
