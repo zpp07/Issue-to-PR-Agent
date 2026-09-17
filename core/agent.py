@@ -152,13 +152,26 @@ def run_agent(
             except json.JSONDecodeError as e:
                 args = {"result": f"参数解析失败：{e}"}
             if trace is not None:
-                trace.append({"step": step, "action": name, "args": args,
-                              "request_id": request_id, "provider_request_id": provider_request_id})
+                trace_record = {"step": step, "action": name, "args": args,
+                                "request_id": request_id,
+                                "provider_request_id": provider_request_id}
+                trace.append(trace_record)
+            else:
+                trace_record = None
 
             try:
                 result = execute_tool(name, args)
             except Exception as e:
                 result = f"工具执行出错：{e}"
+
+            if trace_record is not None:
+                rendered = str(result)
+                trace_record["result_chars"] = len(rendered)
+                # File/search results may contain source code. Keep only their
+                # size; mutation and command outcomes are safe and useful for
+                # diagnosing rejected edits or failed verification commands.
+                if name not in {"read_file", "search_code"}:
+                    trace_record["result_preview"] = rendered[:300]
 
             # 终态工具：finish / review_finish / plan_finish —— 立即返回结构化结果
             if name in ("finish", "review_finish", "plan_finish"):

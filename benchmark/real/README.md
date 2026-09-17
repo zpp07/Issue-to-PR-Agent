@@ -124,3 +124,12 @@ the same case modified the correct `dask/array/overlap.py`, left tests intact,
 and passed all 26 evaluator-selected tests. It used 325,328 tokens and an
 estimated RMB 0.6915. This before/after result is evidence that tool ergonomics
 must be calibrated before interpreting an Agent benchmark as model quality.
+
+The first standardized trial across all six verified tasks passed 3/6: both
+DVC tasks and Dask passed, while both Hydra tasks and Pydantic failed. Full
+per-run metrics and source-free navigation traces are stored in `results.jsonl`;
+the compact table is in `results.md`. The run used 1,349,318 tokens and an
+estimated RMB 2.8051 over 19.1 cumulative minutes. Its failure traces motivated
+an eight-call search budget before additional trials: two failures reached the
+correct implementation but spent the remaining steps searching instead of
+editing.

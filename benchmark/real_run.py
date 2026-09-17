@@ -34,7 +34,9 @@ PROMPT = """You are repairing a real Python repository from a GitHub issue.
 Use search_code once or twice to locate relevant implementation and contract
 evidence. Its citations contain line numbers: inspect those regions with
 read_file start_line/end_line rather than repeatedly searching or reading a
-large file from its beginning. Prefer replace_text for small, exact edits. You
+large file from its beginning. Search has a hard budget of eight calls; after
+you identify a plausible implementation, move to a minimal edit instead of
+trying many query variants. Prefer replace_text for small, exact edits. You
 may edit existing production Python files only. Never edit tests, documentation,
 generated benchmark data, dependency files, or scratch files; attempts will be
 rejected. run_command accepts pytest and ruff only, not python -c or shell
@@ -94,8 +96,56 @@ def compact_trace(trace: list[dict]) -> list[dict]:
                 row[key] = args[key]
         if "query" in args:
             row["query"] = str(args["query"])[:200]
+        if "result_chars" in step:
+            row["result_chars"] = step["result_chars"]
+        if "result_preview" in step:
+            row["result_preview"] = step["result_preview"]
         compact.append(row)
     return compact
+
+
+def with_search_budget(executor, max_calls: int = 8):
+    """Stop unproductive search loops while leaving reads and edits available."""
+    calls = 0
+
+    def budgeted(name, args):
+        nonlocal calls
+        if name == "search_code":
+            calls += 1
+            if calls > max_calls:
+                return ("代码检索预算已耗尽。请使用已有引用按行读取相关文件，"
+                        "提出最小修改并运行聚焦测试。")
+        return executor(name, args)
+
+    return budgeted
+
+
+def generate_report(results_path: str | Path, report_path: str | Path) -> None:
+    source = Path(results_path)
+    rows = ([json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()
+             if line.strip()] if source.is_file() else [])
+    passed = sum(bool(row["tests_pass"]) for row in rows)
+    tokens = sum(row["total_tokens"] for row in rows)
+    cost = sum(row["cost_rmb"] for row in rows)
+    elapsed = sum(row["elapsed_seconds"] for row in rows)
+    lines = [
+        "# Real-repository benchmark results", "",
+        f"- Runs: {len(rows)}", f"- Passed: {passed}/{len(rows)}" if rows else "- Passed: 0/0",
+        f"- Tokens: {tokens:,}", f"- Estimated cost: RMB {cost:.4f}",
+        f"- Cumulative runtime: {elapsed / 60:.1f} minutes", "",
+        "| Case | Trial | Passed | Completed | Modified files | Gold recall | Tokens | Cost (RMB) |",
+        "|---|---:|---:|---:|---|---:|---:|---:|",
+    ]
+    for row in rows:
+        modified = ", ".join(f"`{path}`" for path in row["modified_files"]) or "-"
+        lines.append(
+            f"| `{row['case']}` | {row['trial']} | {str(row['tests_pass']).lower()} | "
+            f"{str(row['agent_completed']).lower()} | {modified} | "
+            f"{row['gold_file_recall']:.0%} | {row['total_tokens']:,} | {row['cost_rmb']:.4f} |"
+        )
+    destination = Path(report_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _fingerprints(workspace: Path, paths: list[str]) -> dict[str, str]:
@@ -140,13 +190,14 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             "Initial retrieved evidence:\n" + format_hits(initial_hits)
         )
         usage, trace = Usage(), []
+        executor = make_executor(
+            workspace, policy=CommandPolicy(),
+            command_runner=sandbox.command_runner(workspace),
+            writable_files=editable, code_search=search,
+        )
         result, usage = run_agent(
             make_client(), PROMPT, TOOLS, task, model=model, max_steps=max_steps,
-            execute_tool=make_executor(
-                workspace, policy=CommandPolicy(),
-                command_runner=sandbox.command_runner(workspace),
-                writable_files=editable, code_search=search,
-            ),
+            execute_tool=with_search_budget(executor),
             usage=usage, trace=trace, max_tokens=max_tokens,
         )
         llm_errors = [step for step in trace if step.get("action") == "llm_error"]
@@ -206,6 +257,7 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=25)
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--output", default="benchmark/real/results.jsonl")
+    parser.add_argument("--report", help="default: output path with .md suffix")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     if args.trials < 1 or args.max_steps < 1:
@@ -247,6 +299,7 @@ def main() -> None:
                 stream.flush()
                 print(f"{case.instance_id:36s} trial={trial} "
                       f"pass={row['tests_pass']} tokens={row['total_tokens']}")
+    generate_report(output, args.report or output.with_suffix(".md"))
     if failures:
         keys = ", ".join(f"{case}/trial-{trial}" for case, trial, _ in failures)
         raise RuntimeError(f"{len(failures)} real evaluation(s) failed without rows: {keys}")

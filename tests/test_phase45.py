@@ -13,7 +13,12 @@ from benchmark.real_cases import (
     select_cases,
     write_jsonl,
 )
-from benchmark.real_run import editable_python_files, load_manifest
+from benchmark.real_run import (
+    editable_python_files,
+    generate_report,
+    load_manifest,
+    with_search_budget,
+)
 from benchmark.real_snapshot import (
     SnapshotAudit,
     audit_snapshot,
@@ -233,3 +238,31 @@ def test_real_runner_write_allowlist_excludes_tests_and_non_python(tmpdir):
     (root / "pkg/config.yaml").write_text("value: 1\n")
     (root / "tests/test_service.py").write_text("def test_value(): pass\n")
     assert editable_python_files(root) == ["pkg/service.py"]
+
+
+def test_real_runner_caps_repeated_search_and_generates_report(tmpdir):
+    calls = []
+
+    def executor(name, args):
+        calls.append((name, args))
+        return "ok"
+
+    budgeted = with_search_budget(executor, max_calls=2)
+    assert budgeted("search_code", {"query": "one"}) == "ok"
+    assert budgeted("search_code", {"query": "two"}) == "ok"
+    assert "预算已耗尽" in budgeted("search_code", {"query": "three"})
+    assert budgeted("read_file", {"path": "pkg/service.py"}) == "ok"
+    assert len(calls) == 3
+
+    results = Path(str(tmpdir)) / "results.jsonl"
+    report = results.with_suffix(".md")
+    results.write_text(json.dumps({
+        "case": "case-a", "trial": 1, "tests_pass": True,
+        "agent_completed": True, "modified_files": ["pkg/service.py"],
+        "gold_file_recall": 1.0, "total_tokens": 1234,
+        "cost_rmb": 0.12, "elapsed_seconds": 60,
+    }) + "\n")
+    generate_report(results, report)
+    text = report.read_text()
+    assert "Passed: 1/1" in text
+    assert "`pkg/service.py`" in text
