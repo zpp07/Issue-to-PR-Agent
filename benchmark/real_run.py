@@ -36,9 +36,11 @@ evidence. Its citations contain line numbers: inspect those regions with
 read_file start_line/end_line rather than repeatedly searching or reading a
 large file from its beginning. Prefer replace_text for small, exact edits. You
 may edit existing production Python files only. Never edit tests, documentation,
-generated benchmark data, or dependency files. Repository commands run offline
-in an isolated container. Run focused tests when practical and finish with a
-concise summary of the fix.
+generated benchmark data, dependency files, or scratch files; attempts will be
+rejected. run_command accepts pytest and ruff only, not python -c or shell
+commands. Repository commands run offline in an isolated container. Run focused
+tests when practical. Once the focused tests pass, stop investigating and call
+finish with a concise summary of the fix.
 """
 
 

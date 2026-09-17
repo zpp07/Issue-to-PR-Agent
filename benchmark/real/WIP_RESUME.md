@@ -52,3 +52,8 @@ The first Dask smoke exposed a real tooling bottleneck: search found
 the file and whole-file writes made a surgical fix impractical. The runner now
 offers bounded line-range reads plus exact `replace_text` edits and records a
 compact, source-free navigation trace for subsequent diagnosis.
+
+The post-tooling Dask smoke passed all 26 evaluator-selected tests, modified
+only the reference production file, and did not tamper with tests. It consumed
+325,328 tokens (estimated RMB 0.6915). Before launching all 18 runs, obtain
+explicit approval for the expected time/cost and keep `--resume` enabled.

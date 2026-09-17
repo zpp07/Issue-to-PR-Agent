@@ -113,3 +113,14 @@ The provider does not expose a reliable random-seed control here, so these are
 recorded as independent `trial` values rather than falsely claiming seeded
 reproducibility. Each row records success, test tampering, modified/gold-file
 overlap, tool usage, tokens, estimated cost and elapsed time.
+
+## Smoke calibration
+
+The first high-budget Dask smoke exposed a tooling failure rather than a model
+repair failure: the retriever found the correct file, but the old whole-file
+read/write interface produced 27 searches, no edit, and a failed score after
+461,167 tokens. After adding bounded line reads and exact local replacement,
+the same case modified the correct `dask/array/overlap.py`, left tests intact,
+and passed all 26 evaluator-selected tests. It used 325,328 tokens and an
+estimated RMB 0.6915. This before/after result is evidence that tool ergonomics
+must be calibrated before interpreting an Agent benchmark as model quality.
