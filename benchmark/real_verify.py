@@ -103,14 +103,14 @@ def _dvc_pass_targets(case: RealCase, root: Path, count: int) -> list[str]:
     return selected
 
 
-def _pytest_command(case: RealCase, root: Path,
-                    pass_sample: int) -> tuple[list[str], int]:
-    pass_targets = (_dvc_pass_targets(case, root, pass_sample)
-                    if case.repo == "iterative/dvc"
-                    else list(case.pass_to_pass[:pass_sample]))
-    raw_targets = list(case.fail_to_pass)
-    raw_targets.extend(pass_targets)
-    targets = list(dict.fromkeys(normalize_pytest_target(target) for target in raw_targets))
+def _selected_pass_targets(case: RealCase, root: Path, pass_sample: int) -> list[str]:
+    return (_dvc_pass_targets(case, root, pass_sample)
+            if case.repo == "iterative/dvc"
+            else list(case.pass_to_pass[:pass_sample]))
+
+
+def _pytest_command_for_targets(case: RealCase, targets: list[str]) -> list[str]:
+    targets = list(dict.fromkeys(normalize_pytest_target(target) for target in targets))
     options = []
     if case.repo == "iterative/dvc":
         # The selected unit tests do not need the root remote-service fixtures;
@@ -121,9 +121,24 @@ def _pytest_command(case: RealCase, root: Path,
         # The repository-wide addopts require benchmark plugins unrelated to
         # these selected correctness tests.
         options.extend(["-o", "addopts="])
-    command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-               *options, *targets]
-    return command, len(pass_targets)
+    return ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            *options, *targets]
+
+
+def _pytest_command(case: RealCase, root: Path,
+                    pass_sample: int) -> tuple[list[str], int]:
+    pass_targets = _selected_pass_targets(case, root, pass_sample)
+    raw_targets = list(case.fail_to_pass)
+    raw_targets.extend(pass_targets)
+    return _pytest_command_for_targets(case, raw_targets), len(pass_targets)
+
+
+def _pass_to_pass_command(case: RealCase, root: Path,
+                          pass_sample: int) -> tuple[list[str] | None, int]:
+    pass_targets = _selected_pass_targets(case, root, pass_sample)
+    if not pass_targets:
+        return None, 0
+    return _pytest_command_for_targets(case, pass_targets), len(pass_targets)
 
 
 def _prepare_fixture_bridge(case: RealCase, workspace: Path) -> None:

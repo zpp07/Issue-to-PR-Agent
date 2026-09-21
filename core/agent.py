@@ -24,7 +24,7 @@ except ImportError:
 
 from core.client import LLMCallError
 from core.usage import Usage
-from core.tools import execute_tool as default_execute_tool
+from core.tools import execute_tool as default_execute_tool, normalize_tool_result
 
 log = logging.getLogger("core.agent")
 
@@ -80,6 +80,9 @@ def run_agent(
     max_tokens=None,
     max_cost_rmb=None,
     final_step_prompt=None,
+    run_state=None,
+    no_progress_after=None,
+    no_progress_prompt=None,
 ):
     """
     通用 agent 循环。
@@ -104,6 +107,14 @@ def run_agent(
         execute_tool = default_execute_tool
     if usage is None:
         usage = Usage()
+    if run_state is None:
+        run_state = {}
+
+    def set_exit(reason):
+        run_state["exit_reason"] = reason
+
+    successful_mutation = False
+    intervention = None
 
     run_id = uuid.uuid4().hex[:8]
     log.info("run_agent 开始 run_id=%s model=%s max_steps=%s max_tokens=%s",
@@ -115,6 +126,20 @@ def run_agent(
     ]
 
     for step in range(max_steps):
+        if (no_progress_after is not None and not successful_mutation
+                and intervention is None and step >= no_progress_after):
+            prompt = no_progress_prompt or (
+                "Investigation has made no successful production edit. Call "
+                "progress_decision now and choose exactly one next direction."
+            )
+            messages.append({"role": "user", "content": prompt})
+            intervention = {
+                "step": step, "action": "no_progress_intervention", "status": "ok",
+                "threshold": no_progress_after,
+            }
+            if trace is not None:
+                trace.append(intervention)
+            run_state["no_progress"] = intervention
         if final_step_prompt and step == max_steps - 1:
             messages.append({"role": "user", "content": final_step_prompt})
         try:
@@ -125,7 +150,8 @@ def run_agent(
             log.error("LLM 调用失败 run_id=%s retryable=%s: %s", run_id, exc.retryable, exc)
             if trace is not None:
                 trace.append({"step": step, "action": "llm_error", "retryable": exc.retryable,
-                              "error": str(exc)})
+                              "error": str(exc), "status": "error"})
+            set_exit("llm_error")
             return {"result": f"LLM 调用失败：{exc}", "retryable": exc.retryable}, usage
         usage.add(pt, ct)
 
@@ -133,10 +159,12 @@ def run_agent(
         if max_tokens is not None and usage.total_tokens > max_tokens:
             log.warning("token 预算耗尽 run_id=%s total=%s > %s",
                         run_id, usage.total_tokens, max_tokens)
+            set_exit("max_tokens")
             return {"result": f"达到 token 预算上限({max_tokens})，未完成"}, usage
         if max_cost_rmb is not None and usage.cost_rmb() > max_cost_rmb:
             log.warning("成本预算耗尽 run_id=%s cost=%.4f > %s",
                         run_id, usage.cost_rmb(), max_cost_rmb)
+            set_exit("max_cost")
             return {"result": f"达到成本预算上限({max_cost_rmb} 元)，未完成"}, usage
 
         tool_calls = getattr(message, "tool_calls", None)
@@ -144,7 +172,12 @@ def run_agent(
             # 兜底：自由文本输出当作完成
             if trace is not None:
                 trace.append({"step": step, "action": "text", "content": getattr(message, "content", None),
-                              "request_id": request_id, "provider_request_id": provider_request_id})
+                              "request_id": request_id, "provider_request_id": provider_request_id,
+                              "status": "ok"})
+            if intervention is not None and "choice" not in intervention:
+                intervention["choice"] = "abandon"
+                intervention["next_action"] = "text"
+            set_exit("free_text")
             return getattr(message, "content", None), usage
 
         messages.append(message)
@@ -167,9 +200,13 @@ def run_agent(
             except Exception as e:
                 result = f"工具执行出错：{e}"
 
+            structured_result = normalize_tool_result(result, name)
+
             if trace_record is not None:
-                rendered = str(result)
+                rendered = structured_result.content
                 trace_record["result_chars"] = len(rendered)
+                trace_record["status"] = structured_result.status
+                trace_record.update(structured_result.metadata)
                 # File/search results may contain source code. Keep only their
                 # size; mutation and command outcomes are safe and useful for
                 # diagnosing rejected edits or failed verification commands.
@@ -178,14 +215,47 @@ def run_agent(
                 ):
                     trace_record["result_preview"] = rendered[:300]
 
+            if (intervention is not None and "next_action" not in intervention
+                    and name != "progress_decision"):
+                intervention["next_action"] = name
+                if "choice" not in intervention:
+                    intervention["choice"] = (
+                        "minimal_edit" if name in {"replace_text", "write_file"}
+                        else "targeted_read" if name in {"read_file", "read_symbol", "search_code"}
+                        else "finish" if name == "finish" else "other"
+                    )
+
+            if name == "progress_decision":
+                choice = args.get("choice")
+                if intervention is None:
+                    if trace_record is not None:
+                        trace_record["status"] = "rejected"
+                        trace_record["result_preview"] = "progress_decision 尚未被无进展检测启用"
+                    structured_result = normalize_tool_result(
+                        "拒绝决策：progress_decision 尚未被无进展检测启用", name
+                    )
+                else:
+                    intervention["choice"] = choice
+                    intervention["reason"] = str(args.get("reason", ""))[:300]
+                if intervention is not None and choice in {"abandon", "finish"}:
+                    set_exit("no_progress")
+                    return {
+                        "result": args.get("reason", "no-progress terminal decision"),
+                        "no_progress_choice": choice,
+                    }, usage
+
+            if structured_result.metadata.get("mutation_applied"):
+                successful_mutation = True
+
             # 终态工具：finish / review_finish / plan_finish —— 立即返回结构化结果
             if name in ("finish", "review_finish", "plan_finish"):
                 final = args.get("result") if name == "finish" else args
                 # finish 的 result 直接是字符串；若是 dict 也原样返回
+                set_exit("finish")
                 return final, usage
 
             # 工具输出截断：防止超大输出塞爆上下文
-            content = str(result)
+            content = structured_result.content
             if len(content) > MAX_TOOL_OUTPUT:
                 total = len(content)
                 content = content[:MAX_TOOL_OUTPUT] + f"\n...[已截断，共 {total} 字符]"
@@ -197,4 +267,5 @@ def run_agent(
             })
 
     log.warning("达到最大步数 run_id=%s max_steps=%s", run_id, max_steps)
+    set_exit("max_steps")
     return {"result": "达到最大步数，未完成"}, usage

@@ -18,7 +18,16 @@ import time
 
 from benchmark.real_cases import RealCase, is_test_path, read_jsonl
 from benchmark.real_snapshot import searchable_files, snapshot_directory
-from benchmark.real_verify import _apply, _prepare_fixture_bridge, _pytest_command
+from benchmark.real_verify import (
+    _apply, _pass_to_pass_command, _prepare_fixture_bridge, _pytest_command,
+)
+from benchmark.protocol import (
+    TRACE_SCHEMA_VERSION,
+    build_agent_protocol,
+    build_evaluation_protocol,
+    git_state,
+    protocol_record,
+)
 from core.agent import run_agent
 from core.client import make_client
 from core.policy import CommandPolicy
@@ -29,16 +38,32 @@ from core.usage import Usage
 
 
 TOOLS = build_tool_registry(
-    "search_code", "read_file", "replace_text", "write_file", "run_command", "finish"
+    "search_code", "read_file", "read_symbol", "replace_text", "write_file",
+    "run_command", "finish"
 )
-PLANNER_TOOLS = build_tool_registry("search_code", "read_file", "plan_finish")
+NO_PROGRESS_TOOLS = build_tool_registry(
+    "search_code", "read_file", "read_symbol", "replace_text", "write_file",
+    "run_command", "progress_decision", "finish"
+)
+PLANNER_TOOLS = build_tool_registry("search_code", "read_file", "read_symbol", "plan_finish")
 EXECUTOR_TOOLS = build_tool_registry(
-    "read_file", "replace_text", "write_file", "run_command", "finish"
+    "read_file", "read_symbol", "replace_text", "write_file", "run_command", "finish"
 )
+SEARCH_BUDGET = 8
+NO_PROGRESS_PROMPT_TEMPLATE = """Investigation has completed {turns} decision turns without a successful
+production-code edit. Call progress_decision now and choose exactly one option:
+minimal_edit, targeted_read, abandon, or finish. Explain the missing evidence or
+reason. If you choose minimal_edit or targeted_read, perform only that focused
+next action on the following turn; do not resume broad searching.
+"""
+
+
+def no_progress_prompt(turns: int) -> str:
+    return NO_PROGRESS_PROMPT_TEMPLATE.format(turns=turns)
 PROMPT = """You are repairing a real Python repository from a GitHub issue.
 Use search_code once or twice to locate relevant implementation and contract
 evidence. Its citations contain line numbers: inspect those regions with
-read_file start_line/end_line rather than repeatedly searching or reading a
+read_symbol or bounded read_file calls rather than repeatedly searching or reading a
 large file from its beginning. Search has a hard budget of eight calls; after
 you identify a plausible implementation, move to a minimal edit instead of
 trying many query variants. Prefer replace_text for small, exact edits. You
@@ -126,6 +151,11 @@ def compact_trace(trace: list[dict]) -> list[dict]:
             row["result_chars"] = step["result_chars"]
         if "result_preview" in step:
             row["result_preview"] = step["result_preview"]
+        for key in (
+            "status", "mutation_applied", "threshold", "choice", "reason", "next_action",
+        ):
+            if key in step:
+                row[key] = step[key]
         compact.append(row)
     return compact
 
@@ -213,23 +243,36 @@ def _phase(trace: list[dict], name: str) -> list[dict]:
 
 def run_repair(client, strategy: str, task: str, executor, model: str,
                max_steps: int, planner_steps: int,
-               max_tokens: int | None
+               max_tokens: int | None, max_cost_rmb: float | None = None,
+               no_progress_after: int | None = None, run_state: dict | None = None,
                ) -> tuple[object, Usage, list[dict], bool | None, dict | None]:
     usage = Usage()
+    if run_state is None:
+        run_state = {}
     if strategy == "single":
         trace: list[dict] = []
+        phase_state: dict = {}
+        single_tools = NO_PROGRESS_TOOLS if no_progress_after is not None else TOOLS
         result, usage = run_agent(
-            client, PROMPT, TOOLS, task, model=model, max_steps=max_steps,
-            execute_tool=with_search_budget(executor), usage=usage, trace=trace,
-            max_tokens=max_tokens,
+            client, PROMPT, single_tools, task, model=model, max_steps=max_steps,
+            execute_tool=with_search_budget(executor, SEARCH_BUDGET), usage=usage,
+            trace=trace, max_tokens=max_tokens, max_cost_rmb=max_cost_rmb,
+            run_state=phase_state, no_progress_after=no_progress_after,
+            no_progress_prompt=(
+                no_progress_prompt(no_progress_after) if no_progress_after is not None else None
+            ),
         )
+        run_state.update(phase_state)
+        run_state["phases"] = {"single": dict(phase_state)}
         return result, usage, _phase(trace, "single"), None, None
 
     planner_trace: list[dict] = []
+    planner_state: dict = {}
     plan, usage = run_agent(
         client, PLANNER_PROMPT, PLANNER_TOOLS, task, model=model,
-        max_steps=planner_steps, execute_tool=with_search_budget(executor),
+        max_steps=planner_steps, execute_tool=with_search_budget(executor, SEARCH_BUDGET),
         usage=usage, trace=planner_trace, max_tokens=max_tokens,
+        max_cost_rmb=max_cost_rmb, run_state=planner_state,
         final_step_prompt=(
             "This is the final planning step. Do not search or read again. "
             "Call plan_finish now using the strongest evidence already collected."
@@ -238,9 +281,12 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
     planner_trace = _phase(planner_trace, "plan")
     planner_completed = isinstance(plan, dict) and isinstance(plan.get("steps"), list)
     if not planner_completed:
+        run_state["exit_reason"] = "planner_incomplete"
+        run_state["phases"] = {"plan": planner_state}
         return plan, usage, planner_trace, False, None
 
     execution_trace: list[dict] = []
+    execution_state: dict = {}
     execution_task = (
         task.split("\n\nInitial retrieved evidence:", 1)[0]
         + "\n\nApproved repair plan:\n"
@@ -250,14 +296,20 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
         client, EXECUTOR_PROMPT, EXECUTOR_TOOLS, execution_task,
         model=model, max_steps=max_steps, execute_tool=executor,
         usage=usage, trace=execution_trace, max_tokens=max_tokens,
+        max_cost_rmb=max_cost_rmb, run_state=execution_state,
     )
+    run_state["exit_reason"] = execution_state.get("exit_reason", "unknown")
+    run_state["phases"] = {"plan": planner_state, "execute": execution_state}
     return result, usage, planner_trace + _phase(execution_trace, "execute"), True, plan
 
 
 def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
                  docker_binary: str, model: str, trial: int,
                  max_steps: int, max_tokens: int | None,
-                 strategy: str = "single", planner_steps: int = 10) -> dict:
+                 strategy: str = "single", planner_steps: int = 10,
+                 max_cost_rmb: float | None = None,
+                 no_progress_after: int | None = None,
+                 provenance: dict | None = None) -> dict:
     started = time.perf_counter()
     source = snapshot_directory(cache_root, case)
     if not source.is_dir():
@@ -290,9 +342,10 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             command_runner=sandbox.command_runner(workspace),
             writable_files=editable, code_search=search,
         )
+        run_state: dict = {}
         result, usage, trace, planner_completed, repair_plan = run_repair(
             make_client(), strategy, task, executor, model, max_steps,
-            planner_steps, max_tokens,
+            planner_steps, max_tokens, max_cost_rmb, no_progress_after, run_state,
         )
         llm_errors = [step for step in trace if step.get("action") == "llm_error"]
         if llm_errors:
@@ -302,7 +355,7 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             raise EvaluationInfrastructureError(
                 latest.get("error", "LLM failure"), bool(latest.get("retryable"))
             )
-        agent_completed = not isinstance(result, dict)
+        agent_completed = run_state.get("exit_reason") == "finish"
 
         after_tests = _fingerprints(workspace, test_paths)
         after_editable = _fingerprints(workspace, editable)
@@ -318,7 +371,16 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
         verification = sandbox.run(
             workspace, command, read_only_workspace=True, timeout=300,
         )
-        return {
+        pass_to_pass_pass = verification.exit_code == 0
+        pass_to_pass_output = "covered by combined passing verification"
+        if verification.exit_code != 0 and selected_pass_count:
+            pass_command, _ = _pass_to_pass_command(case, workspace, pass_sample=5)
+            pass_verification = sandbox.run(
+                workspace, pass_command, read_only_workspace=True, timeout=300,
+            )
+            pass_to_pass_pass = pass_verification.exit_code == 0
+            pass_to_pass_output = pass_verification.output[-1000:]
+        row = {
             "case": case.instance_id, "repo": case.repo, "strategy": strategy,
             "trial": trial,
             "model": model, "image": image, "agent_completed": agent_completed,
@@ -332,17 +394,49 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
                                  len(case.production_files)),
             "fail_to_pass_count": len(case.fail_to_pass),
             "pass_to_pass_sample_count": selected_pass_count,
+            "pass_to_pass_pass": pass_to_pass_pass,
+            "regression_detected": not pass_to_pass_pass,
+            "pass_to_pass_output": pass_to_pass_output,
             "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens, "calls": usage.calls,
             "cost_rmb": round(usage.cost_rmb(), 6),
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "trace_steps": len(trace),
+            "trace_schema_version": TRACE_SCHEMA_VERSION,
+            "exit_reason": run_state.get("exit_reason", "unknown"),
+            "run_state": run_state,
             "trace": compact_trace(trace),
             "search_calls": 1 + sum(step.get("action") == "search_code" for step in trace),
+            "initial_search_calls": 1,
+            "search_tool_calls": sum(
+                step.get("action") == "search_code" for step in trace
+            ),
+            "search_executed": sum(
+                step.get("action") == "search_code" and step.get("status") == "ok"
+                for step in trace
+            ),
+            "search_blocked": sum(
+                step.get("action") == "search_code" and step.get("status") == "blocked"
+                for step in trace
+            ),
             "read_calls": sum(step.get("action") == "read_file" for step in trace),
+            "edit_attempts": sum(
+                step.get("action") in {"replace_text", "write_file"} for step in trace
+            ),
+            "successful_mutations": sum(
+                bool(step.get("mutation_applied")) for step in trace
+            ),
+            "rejected_mutations": sum(
+                step.get("action") in {"replace_text", "write_file"}
+                and step.get("status") in {"rejected", "error"}
+                for step in trace
+            ),
             "verification_output": verification.output[-1000:],
         }
+        if provenance:
+            row.update(provenance)
+        return row
     finally:
         shutil.rmtree(run_root, ignore_errors=True)
 
@@ -360,14 +454,78 @@ def main() -> None:
     parser.add_argument("--planner-steps", type=int, default=10)
     parser.add_argument("--strategy", choices=("single", "plan_execute"), default="single")
     parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--max-cost-rmb", type=float)
+    parser.add_argument(
+        "--no-progress-after", type=int, default=0,
+        help="inject the structured no-progress decision after N edit-free LLM turns; 0 disables",
+    )
+    parser.add_argument("--protocol-dir", default="benchmark/real/protocols")
+    parser.add_argument(
+        "--freeze-protocol-only", action="store_true",
+        help="write the immutable protocol manifest and exit without creating a client or running cases",
+    )
     parser.add_argument("--output", default="benchmark/real/results.jsonl")
     parser.add_argument("--report", help="default: output path with .md suffix")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
-    if args.trials < 1 or args.max_steps < 1 or args.planner_steps < 1:
+    if (args.trials < 1 or args.max_steps < 1 or args.planner_steps < 1
+            or args.no_progress_after < 0):
         parser.error("trials, max-steps and planner-steps must be positive")
 
     selected = load_manifest(args.manifest, args.cases_file)
+
+    no_progress_after = args.no_progress_after or None
+    active_prompts = {"single": PROMPT}
+    active_tools = {"single": (
+        NO_PROGRESS_TOOLS.schemas() if no_progress_after is not None else TOOLS.schemas()
+    )}
+    if args.strategy == "plan_execute":
+        active_prompts = {
+            "planner": PLANNER_PROMPT,
+            "planner_final_step": (
+                "This is the final planning step. Do not search or read again. "
+                "Call plan_finish now using the strongest evidence already collected."
+            ),
+            "executor": EXECUTOR_PROMPT,
+        }
+        active_tools = {"planner": PLANNER_TOOLS.schemas(), "executor": EXECUTOR_TOOLS.schemas()}
+    elif no_progress_after is not None:
+        active_prompts["no_progress"] = no_progress_prompt(no_progress_after)
+    definition = build_agent_protocol(
+        strategy=args.strategy, model=args.model, prompts=active_prompts,
+        tool_schemas=active_tools, max_steps=args.max_steps,
+        planner_steps=args.planner_steps, max_tokens=args.max_tokens,
+        max_cost_rmb=args.max_cost_rmb, search_budget=SEARCH_BUDGET,
+        no_progress={
+            "enabled": no_progress_after is not None,
+            "after_llm_turns": no_progress_after,
+            "max_triggers": 1,
+            "applies_to": "single-before-first-successful-mutation",
+        },
+    )
+    version = f"{args.strategy}-v2-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"
+    agent_protocol = protocol_record(definition, version)
+    evaluation_protocol = build_evaluation_protocol(
+        manifest_path=args.manifest, cases_path=args.cases_file,
+        docker_images=[image for _, image in selected],
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    provenance = {
+        "protocol_version": agent_protocol["protocol_version"],
+        "protocol_hash": agent_protocol["protocol_hash"],
+        **evaluation_protocol,
+        **git_state(repo_root),
+    }
+    protocol_dir = Path(args.protocol_dir)
+    protocol_dir.mkdir(parents=True, exist_ok=True)
+    protocol_path = protocol_dir / (
+        f"{agent_protocol['protocol_hash']}-{evaluation_protocol['evaluation_protocol_hash']}.json"
+    )
+    if not protocol_path.exists():
+        protocol_path.write_text(
+            json.dumps({**agent_protocol, **evaluation_protocol}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     if args.cases != "all":
         requested = {item.strip() for item in args.cases.split(",") if item.strip()}
         available = {case.instance_id for case, _ in selected}
@@ -376,19 +534,26 @@ def main() -> None:
             parser.error(f"cases are not in verified manifest: {', '.join(sorted(unknown))}")
         selected = [(case, image) for case, image in selected if case.instance_id in requested]
 
+    if args.freeze_protocol_only:
+        print(f"protocol_version={agent_protocol['protocol_version']}")
+        print(f"protocol_hash={agent_protocol['protocol_hash']}")
+        print(f"protocol_path={protocol_path}")
+        return
+
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     completed = set()
     if args.resume and output.is_file():
         completed = {(row["case"], row.get("strategy", "single"),
-                      row["trial"], row["model"])
+                      row["trial"], row["model"], row.get("protocol_hash"))
                      for row in (json.loads(line) for line in
                                  output.read_text(encoding="utf-8").splitlines()) if row}
     failures = []
     with output.open("a", encoding="utf-8") as stream:
         for case, image in selected:
             for trial in range(1, args.trials + 1):
-                if (case.instance_id, args.strategy, trial, args.model) in completed:
+                if (case.instance_id, args.strategy, trial, args.model,
+                        agent_protocol["protocol_hash"]) in completed:
                     continue
                 try:
                     for attempt in range(2):
@@ -396,7 +561,8 @@ def main() -> None:
                             row = evaluate_one(
                                 case, image, args.cache_root, args.docker_binary,
                                 args.model, trial, args.max_steps, args.max_tokens,
-                                args.strategy, args.planner_steps,
+                                args.strategy, args.planner_steps, args.max_cost_rmb,
+                                no_progress_after, provenance,
                             )
                             break
                         except EvaluationInfrastructureError as exc:

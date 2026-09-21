@@ -124,6 +124,33 @@ python -m benchmark.harder_run --cases all --methods browse,hybrid `
   --output benchmark/harder_controlled_results.jsonl
 ```
 
+## Phase 4.5：真实仓库评测与失败分层
+
+真实快照评测目前保留 11 条历史运行，来自多种协议和四个代码版本，因此不把它们混成一个
+可泛化的“成功率”。逐条 trace 审计得到以下失败分布；百分比是 token 预算占比：
+
+| 类 | 运行机制 | Runs | Tokens | 占比 |
+|---|---|---:|---:|---:|
+| A | 收敛成功 | 3 | 446,753 | 16% |
+| B | 细粒度定位／决策提交失败，最终只读未收敛 | 4 | 1,084,441 | 39% |
+| C | 成功修改正确文件，但补丁语义错误 | 2 | 672,384 | 24% |
+| D | 只读 Planner 未提交计划 | 1 | 60,914 | 2% |
+| E | 修改后破坏既有行为 | 1 | 478,796 | 18% |
+
+最高频问题是 B 类，而不是缺少 Reviewer。后续顺序因此调整为：先建立可信协议与 trace，
+再提供 `read_symbol` 和可记录的无进展干预，最后才进入 Reviewer + Reviser。仓库规模与
+结果在 6 个任务中相关，但 `hydra-1006`（723 个文件、两次正确文件 recall=1.0）表明不能
+把约 400 文件写成因果能力边界。
+
+原始 JSONL 保持 append-only；旧 11 行通过行哈希做只读 provenance 映射。分类可复现：
+
+```powershell
+python -m benchmark.analyze_real_results --show-provenance
+```
+
+新运行会记录 `protocol_hash`、`code_revision`、`trace_schema_version`、工具状态和
+`exit_reason`。任何新的付费真实模型实验仍需单独批准。
+
 ## Phase 5：有来源的任务记忆
 
 `core/memory.py` 只允许四类持久化内容：逐字文件事实、已批准计划中的测试命令、测试失败、

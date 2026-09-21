@@ -1,0 +1,13 @@
+{
+  "d93f61e478b99099c33a24fe4e7a1986f6a7374ba0c8553e5bfa5f30c28901ed": {"code_revision": "bc54a5d", "recorded_in_revision": "cd142b5", "protocol_version": "single-pre-search-budget", "failure_class": "A"},
+  "741393374cb5f9f1fbb25b2c1401e68820baa8143c5c4fe15e0b63764964489b": {"code_revision": "bc54a5d", "recorded_in_revision": "cd142b5", "protocol_version": "single-pre-search-budget", "failure_class": "B"},
+  "4e659b24cdeba841cb6b71d9ab95339d5c329f8464d48394636c3882c5ba873c": {"code_revision": "bc54a5d", "recorded_in_revision": "cd142b5", "protocol_version": "single-pre-search-budget", "failure_class": "A"},
+  "5355bfe517647057142a8bbd682ead11706fd5870cad37d86483af6d9c274e7d": {"code_revision": "bc54a5d", "recorded_in_revision": "cd142b5", "protocol_version": "single-pre-search-budget", "failure_class": "B"},
+  "37bc8a86d0c517ae61bb698aa9c2a82936476a169b233ce4eee69b40a87fe623": {"code_revision": "bc54a5d", "recorded_in_revision": "cd142b5", "protocol_version": "single-pre-search-budget", "failure_class": "C"},
+  "e09ca34e8676bc259daf428f61c14966c18153b1d2d5844a0e05eed10b954e41": {"code_revision": "bc54a5d", "recorded_in_revision": "cd142b5", "protocol_version": "single-pre-search-budget", "failure_class": "A"},
+  "4c3d6d095813360431dc1dcf5202b6fd5382ee9160575d9ff2c468a34380c28f": {"code_revision": "cd142b5", "recorded_in_revision": "1af95bd", "protocol_version": "single-search-budget-v1", "failure_class": "B"},
+  "c44f7b03f388006cd6d774373239373c287114470f7196326349541b785247d1": {"code_revision": "cd142b5", "recorded_in_revision": "1af95bd", "protocol_version": "single-search-budget-v1", "failure_class": "B"},
+  "22f71374584cd0ed02f65320c033996e54aeb98c9b81c196d063d033e5e3800d": {"code_revision": "cd142b5", "recorded_in_revision": "1af95bd", "protocol_version": "single-search-budget-v1", "failure_class": "C"},
+  "2511ff4b7d5e0568c42d885638fdb3a6d11fbddb4fe26a20f402e807f1737c24": {"code_revision": "bb0e944", "recorded_in_revision": "acd3463", "protocol_version": "plan-execute-v1", "failure_class": "D"},
+  "d6f9bd2169b19b6644c5e5eb5e7c91f04ddb5edd34e748247a168e1f59d7a0c7": {"code_revision": "acd3463", "recorded_in_revision": "ef90451", "protocol_version": "plan-execute-terminal-v2", "failure_class": "E"}
+}

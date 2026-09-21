@@ -8,10 +8,14 @@
 - read_file / write_file / run_command：文件与 shell
 - finish：富结构化收尾工具（替代旧的 final_answer 自由文本）
 """
+from __future__ import annotations
+
 import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 import subprocess
+from typing import Any
 
 # ---------- Phase 1 可靠性：上限与超时 ----------
 MAX_FILE_BYTES = 200 * 1024     # 读/写文件大小上限（200KB），防止超大文件塞爆上下文
@@ -19,6 +23,43 @@ MAX_WHOLE_FILE_BYTES = 12 * 1024  # 整体读取需能完整进入 Agent 工具�
 MAX_READ_LINES = 200            # 单次分段读取上限，避免大文件淹没上下文
 MAX_COMMAND_OUTPUT = 4000       # 命令输出截断长度
 COMMAND_TIMEOUT = 30            # 命令默认超时（秒），防止挂起命令卡死 agent
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """Structured executor result while remaining string-compatible."""
+
+    content: str
+    status: str = "ok"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __str__(self):
+        return self.content
+
+    def __contains__(self, item):
+        return item in self.content
+
+
+def normalize_tool_result(result, name: str = "") -> ToolResult:
+    """Accept legacy string executors but emit a stable trace status."""
+    if isinstance(result, ToolResult):
+        return result
+    content = str(result)
+    if content.startswith("代码检索预算已耗尽"):
+        status = "blocked"
+    elif content.startswith(("拒绝", "命令被策略拒绝", "命令需要人工审批")):
+        status = "rejected"
+    elif content.startswith((
+        "读取失败", "写入失败", "替换失败", "命令执行失败", "命令超时",
+        "工具执行出错", "未知工具",
+    )):
+        status = "error"
+    else:
+        status = "ok"
+    metadata = {}
+    if name in {"replace_text", "write_file"}:
+        metadata["mutation_applied"] = status == "ok"
+    return ToolResult(content, status, metadata)
 
 
 # ---------- 基础文件/命令工具 ----------
@@ -158,6 +199,26 @@ TOOL_SCHEMAS = {
             },
         },
     },
+    "read_symbol": {
+        "type": "function",
+        "function": {
+            "name": "read_symbol",
+            "description": (
+                "按 qualified Python symbol 精确读取定义及有界上下文；歧义时返回候选，"
+                "不要猜测 occurrence"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Python 文件路径"},
+                    "symbol": {"type": "string", "description": "如 GroupDefault.get_override_key"},
+                    "occurrence": {"type": "integer", "minimum": 0},
+                    "context_lines": {"type": "integer", "minimum": 0, "maximum": 50, "default": 3},
+                },
+                "required": ["path", "symbol"],
+            },
+        },
+    },
     "replace_text": {
         "type": "function",
         "function": {
@@ -222,6 +283,24 @@ TOOL_SCHEMAS = {
             },
         },
     },
+    "progress_decision": {
+        "type": "function",
+        "function": {
+            "name": "progress_decision",
+            "description": "仅在收到无进展提示后，结构化选择下一步方向",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "choice": {
+                        "type": "string",
+                        "enum": ["minimal_edit", "targeted_read", "abandon", "finish"],
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["choice", "reason"],
+            },
+        },
+    },
     # Reviewer 专用：结构化审查结论
     "review_finish": {
         "type": "function",
@@ -271,6 +350,12 @@ def execute_tool(name, args):
         return "代码检索未绑定工作区"
     elif name == "read_file":
         return read_file(args["path"], args.get("start_line"), args.get("end_line"))
+    elif name == "read_symbol":
+        from core.symbols import read_symbol_source
+        return json.dumps(read_symbol_source(
+            args["path"], args["symbol"], args.get("occurrence"),
+            args.get("context_lines", 3),
+        ), ensure_ascii=False)
     elif name == "write_file":
         return write_file(args["path"], args["content"])
     elif name == "replace_text":
@@ -283,6 +368,8 @@ def execute_tool(name, args):
         # 返回 JSON 字符串，让 agent 循环能结构化解析
         return json.dumps(args, ensure_ascii=False)
     elif name == "plan_finish":
+        return json.dumps(args, ensure_ascii=False)
+    elif name == "progress_decision":
         return json.dumps(args, ensure_ascii=False)
     return f"未知工具：{name}"
 
@@ -340,20 +427,41 @@ def make_executor(workdir, policy=None, approval_callback=None, command_runner=N
             if not inside:
                 return f"拒绝读取：路径 {p} 在工作区之外"
             return read_file(p, args.get("start_line"), args.get("end_line"))
+        elif name == "read_symbol":
+            p, inside = check_inside(args["path"])
+            if not inside:
+                return f"拒绝读取：路径 {p} 在工作区之外"
+            from core.symbols import read_symbol_source
+            payload = read_symbol_source(
+                p, args["symbol"], args.get("occurrence"),
+                args.get("context_lines", 3),
+            )
+            status = "ok" if payload.get("status") == "ok" else (
+                "rejected" if payload.get("status") in {"ambiguous", "not_found"} else "error"
+            )
+            return ToolResult(json.dumps(payload, ensure_ascii=False), status)
         elif name == "write_file":
             p, inside = check_inside(args["path"])
             if not inside:
                 return f"拒绝写入：路径 {p} 在工作区之外"
             if allowed_writes is not None and os.path.normcase(p) not in allowed_writes:
                 return f"拒绝写入：路径 {p} 不在本任务的写入 allowlist"
-            return write_file(p, args["content"])
+            before = Path(p).read_bytes() if Path(p).is_file() else None
+            content = write_file(p, args["content"])
+            status = "error" if content.startswith("写入失败") else "ok"
+            after = Path(p).read_bytes() if status == "ok" and Path(p).is_file() else before
+            return ToolResult(content, status, {"mutation_applied": status == "ok" and before != after})
         elif name == "replace_text":
             p, inside = check_inside(args["path"])
             if not inside:
                 return f"拒绝写入：路径 {p} 在工作区之外"
             if allowed_writes is not None and os.path.normcase(p) not in allowed_writes:
                 return f"拒绝写入：路径 {p} 不在本任务的写入 allowlist"
-            return replace_text(p, args["old"], args["new"])
+            before = Path(p).read_bytes() if Path(p).is_file() else None
+            content = replace_text(p, args["old"], args["new"])
+            status = "rejected" if content.startswith("替换失败") else "ok"
+            after = Path(p).read_bytes() if status == "ok" and Path(p).is_file() else before
+            return ToolResult(content, status, {"mutation_applied": status == "ok" and before != after})
         elif name == "run_command":
             argv = args.get("argv")
             if policy is not None:
@@ -372,6 +480,8 @@ def make_executor(workdir, policy=None, approval_callback=None, command_runner=N
         elif name == "review_finish":
             return json.dumps(args, ensure_ascii=False)
         elif name == "plan_finish":
+            return json.dumps(args, ensure_ascii=False)
+        elif name == "progress_decision":
             return json.dumps(args, ensure_ascii=False)
         return f"未知工具：{name}"
 
