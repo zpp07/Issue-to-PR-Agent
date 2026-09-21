@@ -360,6 +360,7 @@ def run_review_revise(client, task: str, candidate_patch: str, visible_test_evid
             "This is the final review step. Call review_finish now using only visible evidence."
         ),
         final_step_tool_names={"review_finish"},
+        terminal_tool_reserve=2,
     )
     if review_state.get("exit_reason") == "llm_error":
         latest = next(
@@ -709,9 +710,10 @@ def main() -> None:
             "hidden_tests_used_for_control": False,
             "terminal_tool_enforcement": {
                 "planner": ["plan_finish"],
-                "reviewer": ["review_finish"],
+                "reviewer": {"tools": ["review_finish"], "reserved_turns": 2},
                 "reviser": ["finish"],
             },
+            "reject_calls_to_unexposed_tools": True,
             "review_output_normalization": (
                 "missing-issues-is-empty-only-when-passed-true"
                 if args.strategy == "review_revise" else "not-applicable"
@@ -726,7 +728,7 @@ def main() -> None:
         },
     )
     finish_mode = "verified-auto" if args.auto_finish_verified_patch else "model-finish"
-    version = f"{args.strategy}-v5-{finish_mode}-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"
+    version = f"{args.strategy}-v6-{finish_mode}-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"
     agent_protocol = protocol_record(definition, version)
     evaluation_protocol = build_evaluation_protocol(
         manifest_path=args.manifest, cases_path=args.cases_file,

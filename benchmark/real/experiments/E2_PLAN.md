@@ -67,4 +67,7 @@ final turn to `review_finish` and treats any invalid conclusion as
 `review_incomplete` without revision. A subsequent v4 preflight showed that the
 provider can omit the required empty `issues=[]` when returning `passed=true`.
 Protocol v5 normalizes only that unambiguous positive case; a negative review
-without issues remains incomplete. Formal E2 rows use v5 only.
+without issues remains incomplete. The v5 preflight then revealed that a provider
+may emit a tool call omitted from the current turn's schema. Protocol v6 rejects
+all unexposed tool calls and reserves the final two Reviewer turns for
+`review_finish`. Formal E2 rows use v6 only.

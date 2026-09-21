@@ -142,6 +142,52 @@ def test_agent_injects_final_step_terminal_reminder():
     assert [tool["function"]["name"] for tool in calls[1]["tools"]] == ["plan_finish"]
 
 
+def test_agent_rejects_tool_not_exposed_on_terminal_turn():
+    calls = []
+
+    def response(name, arguments, call_id):
+        tool_call = SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=None, tool_calls=[tool_call]
+            ))], usage=None, _request_id=call_id,
+        )
+
+    responses = [
+        response("read_file", {"path": "sample.py"}, "hallucinated-read"),
+        response("plan_finish", {
+            "goal": "fix", "affected_files": ["sample.py"], "steps": ["edit"],
+            "risks": [], "allowed_commands": [],
+        }, "plan"),
+    ]
+    executed = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    client = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(create=create)
+    ))
+    trace = []
+    result, _ = run_agent(
+        client, "system", build_tool_registry("read_file", "plan_finish"),
+        "task", max_steps=2, execute_tool=lambda name, args: executed.append(name) or "ok",
+        trace=trace, final_step_prompt="submit", final_step_tool_names={"plan_finish"},
+        terminal_tool_reserve=2,
+    )
+    assert result["goal"] == "fix"
+    assert executed == ["plan_finish"]
+    assert trace[0]["action"] == "read_file" and trace[0]["status"] == "rejected"
+    assert all(
+        [tool["function"]["name"] for tool in call["tools"]] == ["plan_finish"]
+        for call in calls
+    )
+
+
 def test_benchmark_write_allowlist_protects_public_tests(tmpdir):
     root = Path(str(tmpdir))
     source = root / "buggy.py"

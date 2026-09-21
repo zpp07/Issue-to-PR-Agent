@@ -101,6 +101,7 @@ def run_agent(
     no_progress_prompt=None,
     auto_finish_after_verified_patch=False,
     final_step_tool_names=None,
+    terminal_tool_reserve=1,
 ):
     """
     通用 agent 循环。
@@ -194,7 +195,8 @@ def run_agent(
             if trace is not None:
                 trace.append(intervention)
             run_state["no_progress"] = intervention
-        if final_step_prompt and step == max_steps - 1:
+        terminal_start = max(0, max_steps - max(1, int(terminal_tool_reserve)))
+        if final_step_prompt and step == terminal_start:
             messages.append({"role": "user", "content": final_step_prompt})
         try:
             visible_tools = tools.schemas()
@@ -203,7 +205,7 @@ def run_agent(
                     schema for schema in visible_tools
                     if schema.get("function", {}).get("name") != "progress_decision"
                 ]
-            if final_step_tool_names is not None and step == max_steps - 1:
+            if final_step_tool_names is not None and step >= terminal_start:
                 allowed_final = set(final_step_tool_names)
                 visible_tools = [
                     schema for schema in visible_tools
@@ -211,6 +213,9 @@ def run_agent(
                 ]
                 if not visible_tools:
                     raise ValueError("final_step_tool_names did not match any registered tool")
+            visible_tool_names = {
+                schema.get("function", {}).get("name") for schema in visible_tools
+            }
             message, (pt, ct), request_id, provider_request_id = _llm_call(
                 client, messages, visible_tools, model
             )
@@ -265,7 +270,10 @@ def run_agent(
                 trace_record = None
 
             rejected_by_intervention = False
-            if intervention is not None and name != "progress_decision":
+            rejected_as_unavailable = name not in visible_tool_names
+            if rejected_as_unavailable:
+                result = f"拒绝操作：工具 {name} 当前阶段未暴露"
+            elif intervention is not None and name != "progress_decision":
                 allowed = {
                     "minimal_edit": {"replace_text", "write_file"},
                     "targeted_read": {"read_file", "read_symbol"},
@@ -292,11 +300,15 @@ def run_agent(
                     result = f"工具执行出错：{e}"
 
             structured_result = normalize_tool_result(result, name)
+            if rejected_as_unavailable:
+                structured_result = normalize_tool_result(result, name)
 
             if trace_record is not None:
                 rendered = structured_result.content
                 trace_record["result_chars"] = len(rendered)
                 trace_record["status"] = structured_result.status
+                if rejected_as_unavailable:
+                    trace_record["status"] = "rejected"
                 trace_record.update(structured_result.metadata)
                 # File/search results may contain source code. Keep only their
                 # size; mutation and command outcomes are safe and useful for
@@ -376,7 +388,7 @@ def run_agent(
                     }, usage
 
             # 终态工具：finish / review_finish / plan_finish —— 立即返回结构化结果
-            if name in ("finish", "review_finish", "plan_finish"):
+            if name in ("finish", "review_finish", "plan_finish") and not rejected_as_unavailable:
                 final = args.get("result") if name == "finish" else args
                 # finish 的 result 直接是字符串；若是 dict 也原样返回
                 set_exit("finish")
