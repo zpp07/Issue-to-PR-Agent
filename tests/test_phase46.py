@@ -240,6 +240,33 @@ def test_patch_reviewer_pass_skips_reviser():
     assert all(item["phase"] == "review" for item in trace)
 
 
+def test_incomplete_patch_review_never_triggers_reviser():
+    responses = [
+        _tool_response("read_file", {"path": "pkg.py"}, "read"),
+        _tool_response("finish", {"result": "wrong terminal tool"}, "wrong"),
+    ]
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    client = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(create=create)
+    ))
+    state = {"phases": {}}
+    _, _, _, review, revised = run_review_revise(
+        client, "Repository: owner/repo\nIssue: fix",
+        "--- a/pkg.py\n+++ b/pkg.py\n-old\n+new\n", "",
+        lambda *_: "ok", "test-model", Usage(), None, None,
+        reviewer_steps=2, run_state=state,
+    )
+    assert revised is False
+    assert review["incomplete"] is True
+    assert state["exit_reason"] == "review_incomplete"
+    assert [tool["function"]["name"] for tool in calls[-1]["tools"]] == ["review_finish"]
+
+
 def test_progress_decision_tool_is_hidden_until_intervention():
     calls = []
     responses = [

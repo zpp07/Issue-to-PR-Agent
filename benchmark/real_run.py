@@ -299,6 +299,7 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
             "This is the final planning step. Do not search or read again. "
             "Call plan_finish now using the strongest evidence already collected."
         ),
+        final_step_tool_names={"plan_finish"},
     )
     planner_trace = _phase(planner_trace, "plan")
     planner_completed = isinstance(plan, dict) and isinstance(plan.get("steps"), list)
@@ -358,6 +359,7 @@ def run_review_revise(client, task: str, candidate_patch: str, visible_test_evid
         final_step_prompt=(
             "This is the final review step. Call review_finish now using only visible evidence."
         ),
+        final_step_tool_names={"review_finish"},
     )
     if review_state.get("exit_reason") == "llm_error":
         latest = next(
@@ -366,15 +368,24 @@ def run_review_revise(client, task: str, candidate_patch: str, visible_test_evid
         raise EvaluationInfrastructureError(
             latest.get("error", "Reviewer LLM failure"), bool(latest.get("retryable"))
         )
-    structured_review = review if isinstance(review, dict) else {
+    review_valid = bool(
+        isinstance(review, dict)
+        and isinstance(review.get("passed"), bool)
+        and isinstance(review.get("issues"), list)
+    )
+    structured_review = review if review_valid else {
         "passed": False,
-        "issues": ["Reviewer did not return a structured conclusion."],
+        "issues": [],
         "incomplete": True,
+        "reason": "Reviewer did not return a structured review_finish conclusion.",
     }
     issues = [str(item) for item in structured_review.get("issues") or []]
     passed = bool(structured_review.get("passed")) and not issues
     phases = run_state.setdefault("phases", {})
     phases["review"] = dict(review_state)
+    if not review_valid or (not passed and not issues):
+        run_state["exit_reason"] = "review_incomplete"
+        return review, usage, _phase(review_trace, "review"), structured_review, False
     if passed:
         run_state["exit_reason"] = "review_passed"
         return review, usage, _phase(review_trace, "review"), structured_review, False
@@ -398,6 +409,7 @@ def run_review_revise(client, task: str, candidate_patch: str, visible_test_evid
             "This is the final revision step. Run the focused pytest command if needed, "
             "then call finish; do not start another investigation."
         ),
+        final_step_tool_names={"finish"},
     )
     if revision_state.get("exit_reason") == "llm_error":
         latest = next(
@@ -690,6 +702,11 @@ def main() -> None:
             "requires_successful_mutation": True,
             "accepted_verification": "pytest-exit-zero-after-latest-mutation",
             "hidden_tests_used_for_control": False,
+            "terminal_tool_enforcement": {
+                "planner": ["plan_finish"],
+                "reviewer": ["review_finish"],
+                "reviser": ["finish"],
+            },
         },
         stage_budgets={
             "coder_or_executor_steps": args.max_steps,
@@ -700,7 +717,7 @@ def main() -> None:
         },
     )
     finish_mode = "verified-auto" if args.auto_finish_verified_patch else "model-finish"
-    version = f"{args.strategy}-v3-{finish_mode}-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"
+    version = f"{args.strategy}-v4-{finish_mode}-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"
     agent_protocol = protocol_record(definition, version)
     evaluation_protocol = build_evaluation_protocol(
         manifest_path=args.manifest, cases_path=args.cases_file,

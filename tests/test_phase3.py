@@ -134,10 +134,12 @@ def test_agent_injects_final_step_terminal_reminder():
         client, "system", build_tool_registry("read_file", "plan_finish"),
         "task", max_steps=2, execute_tool=lambda name, args: "source",
         final_step_prompt="submit the plan now",
+        final_step_tool_names={"plan_finish"},
     )
     assert result["goal"] == "fix"
     assert any(message.get("content") == "submit the plan now"
                for message in calls[1]["messages"] if isinstance(message, dict))
+    assert [tool["function"]["name"] for tool in calls[1]["tools"]] == ["plan_finish"]
 
 
 def test_benchmark_write_allowlist_protects_public_tests(tmpdir):

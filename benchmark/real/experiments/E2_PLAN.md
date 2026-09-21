@@ -57,3 +57,11 @@ completion and per-run caps stop runs early.
 
 With 12 runs per arm, results are diagnostic rather than statistically definitive.
 Raw JSONL remains append-only, and the report must retain null or negative findings.
+
+## Pilot note
+
+The first `review_revise-v3` smoke is retained but excluded from the planned arm C
+summary. It exposed a control bug: an unstructured Reviewer timeout incorrectly
+triggered a Reviser with no actionable issues. Protocol v4 restricts the Reviewer's
+final turn to `review_finish` and treats any invalid conclusion as
+`review_incomplete` without revision. Formal E2 rows use v4 only.

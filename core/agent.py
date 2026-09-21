@@ -100,6 +100,7 @@ def run_agent(
     no_progress_after=None,
     no_progress_prompt=None,
     auto_finish_after_verified_patch=False,
+    final_step_tool_names=None,
 ):
     """
     通用 agent 循环。
@@ -202,6 +203,14 @@ def run_agent(
                     schema for schema in visible_tools
                     if schema.get("function", {}).get("name") != "progress_decision"
                 ]
+            if final_step_tool_names is not None and step == max_steps - 1:
+                allowed_final = set(final_step_tool_names)
+                visible_tools = [
+                    schema for schema in visible_tools
+                    if schema.get("function", {}).get("name") in allowed_final
+                ]
+                if not visible_tools:
+                    raise ValueError("final_step_tool_names did not match any registered tool")
             message, (pt, ct), request_id, provider_request_id = _llm_call(
                 client, messages, visible_tools, model
             )
