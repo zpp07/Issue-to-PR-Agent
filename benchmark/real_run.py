@@ -368,12 +368,17 @@ def run_review_revise(client, task: str, candidate_patch: str, visible_test_evid
         raise EvaluationInfrastructureError(
             latest.get("error", "Reviewer LLM failure"), bool(latest.get("retryable"))
         )
+    normalized_review = dict(review) if isinstance(review, dict) else {}
+    if normalized_review.get("passed") is True and "issues" not in normalized_review:
+        # Some OpenAI-compatible providers omit a required empty array.  This
+        # normalization is unambiguous only for a positive review; a negative
+        # review without actionable issues remains incomplete.
+        normalized_review["issues"] = []
     review_valid = bool(
-        isinstance(review, dict)
-        and isinstance(review.get("passed"), bool)
-        and isinstance(review.get("issues"), list)
+        isinstance(normalized_review.get("passed"), bool)
+        and isinstance(normalized_review.get("issues"), list)
     )
-    structured_review = review if review_valid else {
+    structured_review = normalized_review if review_valid else {
         "passed": False,
         "issues": [],
         "incomplete": True,
@@ -707,6 +712,10 @@ def main() -> None:
                 "reviewer": ["review_finish"],
                 "reviser": ["finish"],
             },
+            "review_output_normalization": (
+                "missing-issues-is-empty-only-when-passed-true"
+                if args.strategy == "review_revise" else "not-applicable"
+            ),
         },
         stage_budgets={
             "coder_or_executor_steps": args.max_steps,
@@ -717,7 +726,7 @@ def main() -> None:
         },
     )
     finish_mode = "verified-auto" if args.auto_finish_verified_patch else "model-finish"
-    version = f"{args.strategy}-v4-{finish_mode}-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"
+    version = f"{args.strategy}-v5-{finish_mode}-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"
     agent_protocol = protocol_record(definition, version)
     evaluation_protocol = build_evaluation_protocol(
         manifest_path=args.manifest, cases_path=args.cases_file,

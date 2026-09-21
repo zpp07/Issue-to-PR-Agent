@@ -64,4 +64,7 @@ The first `review_revise-v3` smoke is retained but excluded from the planned arm
 summary. It exposed a control bug: an unstructured Reviewer timeout incorrectly
 triggered a Reviser with no actionable issues. Protocol v4 restricts the Reviewer's
 final turn to `review_finish` and treats any invalid conclusion as
-`review_incomplete` without revision. Formal E2 rows use v4 only.
+`review_incomplete` without revision. A subsequent v4 preflight showed that the
+provider can omit the required empty `issues=[]` when returning `passed=true`.
+Protocol v5 normalizes only that unambiguous positive case; a negative review
+without issues remains incomplete. Formal E2 rows use v5 only.

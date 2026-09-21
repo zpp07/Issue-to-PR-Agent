@@ -240,6 +240,18 @@ def test_patch_reviewer_pass_skips_reviser():
     assert all(item["phase"] == "review" for item in trace)
 
 
+def test_positive_review_normalizes_provider_omitted_empty_issues():
+    responses = [_tool_response("review_finish", {"passed": True}, "review")]
+    state = {"phases": {}}
+    _, _, _, review, revised = run_review_revise(
+        _client(responses), "Repository: owner/repo\nIssue: fix",
+        "--- a/pkg.py\n+++ b/pkg.py\n-old\n+new\n", "",
+        lambda *_: "ok", "test-model", Usage(), None, None, run_state=state,
+    )
+    assert review == {"passed": True, "issues": []}
+    assert revised is False and state["exit_reason"] == "review_passed"
+
+
 def test_incomplete_patch_review_never_triggers_reviser():
     responses = [
         _tool_response("read_file", {"path": "pkg.py"}, "read"),
