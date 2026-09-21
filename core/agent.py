@@ -32,6 +32,22 @@ log = logging.getLogger("core.agent")
 MAX_TOOL_OUTPUT = 12000
 
 
+def _is_executing_pytest(argv):
+    """Accept actual pytest execution, not metadata/collection-only probes."""
+    if not isinstance(argv, list):
+        return False
+    direct = bool(argv and str(argv[0]).lower() == "pytest")
+    module = bool(
+        len(argv) >= 3
+        and str(argv[0]).lower() in {"python", "python.exe"}
+        and argv[1:3] == ["-m", "pytest"]
+    )
+    if not (direct or module):
+        return False
+    non_executing = {"--collect-only", "--co", "--help", "-h", "--version"}
+    return not any(str(item).lower() in non_executing for item in argv)
+
+
 def _llm_call(client, messages, tools, model):
     """一次 LLM 调用，带异常分类与日志。
 
@@ -83,6 +99,7 @@ def run_agent(
     run_state=None,
     no_progress_after=None,
     no_progress_prompt=None,
+    auto_finish_after_verified_patch=False,
 ):
     """
     通用 agent 循环。
@@ -114,6 +131,9 @@ def run_agent(
         run_state["exit_reason"] = reason
 
     successful_mutation = False
+    successful_mutations = 0
+    patch_revision = 0
+    verified_revision = None
     intervention = None
     pending_direction = None
 
@@ -125,6 +145,38 @@ def run_agent(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": task},
     ]
+
+    run_state["completion_policy"] = {
+        "auto_finish_after_verified_patch": bool(auto_finish_after_verified_patch),
+        "requires_successful_mutation": True,
+        "accepted_verification": "pytest exit code 0 after latest mutation",
+    }
+
+    def update_budget_state(step_index):
+        run_state["budget_state"] = {
+            "max_steps": max_steps,
+            "steps_used": step_index + 1,
+            "remaining_steps": max(0, max_steps - step_index - 1),
+            "max_tokens": max_tokens,
+            "tokens_used": usage.total_tokens,
+            "remaining_tokens": (
+                None if max_tokens is None else max(0, max_tokens - usage.total_tokens)
+            ),
+            "max_cost_rmb": max_cost_rmb,
+            "cost_rmb": usage.cost_rmb(),
+        }
+
+    def update_patch_state():
+        run_state["patch_state"] = {
+            "successful_mutations": successful_mutations,
+            "patch_revision": patch_revision,
+            "verified_revision": verified_revision,
+            "latest_patch_verified": (
+                patch_revision > 0 and verified_revision == patch_revision
+            ),
+        }
+
+    update_patch_state()
 
     for step in range(max_steps):
         if (no_progress_after is not None and not successful_mutation
@@ -161,6 +213,7 @@ def run_agent(
             set_exit("llm_error")
             return {"result": f"LLM 调用失败：{exc}", "retryable": exc.retryable}, usage
         usage.add(pt, ct)
+        update_budget_state(step)
 
         # 预算上限检查：token / 成本
         if max_tokens is not None and usage.total_tokens > max_tokens:
@@ -273,6 +326,45 @@ def run_agent(
 
             if structured_result.metadata.get("mutation_applied"):
                 successful_mutation = True
+                successful_mutations += 1
+                patch_revision += 1
+                verified_revision = None
+                update_patch_state()
+
+            argv = args.get("argv") if name == "run_command" else None
+            is_pytest = _is_executing_pytest(argv)
+            if (
+                is_pytest
+                and structured_result.metadata.get("command_exit_code") == 0
+                and patch_revision > 0
+            ):
+                verified_revision = patch_revision
+                update_patch_state()
+                evidence = {
+                    "kind": "post_mutation_pytest",
+                    "patch_revision": patch_revision,
+                    "argv": argv,
+                    "exit_code": 0,
+                    "step": step,
+                }
+                run_state["completion_evidence"] = evidence
+                if auto_finish_after_verified_patch:
+                    controller_event = {
+                        "step": step,
+                        "action": "controller_finish",
+                        "status": "ok",
+                        "reason": "latest_patch_verified",
+                        "patch_revision": patch_revision,
+                        "remaining_steps": max(0, max_steps - step - 1),
+                    }
+                    if trace is not None:
+                        trace.append(controller_event)
+                    set_exit("verified_patch")
+                    return {
+                        "result": "最新补丁已通过修改后的 pytest，控制器结束运行",
+                        "auto_finished": True,
+                        "completion_evidence": evidence,
+                    }, usage
 
             # 终态工具：finish / review_finish / plan_finish —— 立即返回结构化结果
             if name in ("finish", "review_finish", "plan_finish"):
@@ -294,5 +386,6 @@ def run_agent(
             })
 
     log.warning("达到最大步数 run_id=%s max_steps=%s", run_id, max_steps)
-    set_exit("max_steps")
+    set_exit("max_steps_unverified_patch" if successful_mutation else "max_steps_no_patch")
+    update_patch_state()
     return {"result": "达到最大步数，未完成"}, usage

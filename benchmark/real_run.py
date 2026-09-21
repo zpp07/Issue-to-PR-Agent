@@ -49,6 +49,10 @@ PLANNER_TOOLS = build_tool_registry("search_code", "read_file", "read_symbol", "
 EXECUTOR_TOOLS = build_tool_registry(
     "read_file", "read_symbol", "replace_text", "write_file", "run_command", "finish"
 )
+PATCH_REVIEWER_TOOLS = build_tool_registry("read_file", "read_symbol", "review_finish")
+REVISER_TOOLS = build_tool_registry(
+    "read_file", "read_symbol", "replace_text", "write_file", "run_command", "finish"
+)
 SEARCH_BUDGET = 8
 NO_PROGRESS_PROMPT_TEMPLATE = """Investigation has completed {turns} decision turns without a successful
 production-code edit. Call progress_decision now and choose exactly one option:
@@ -87,6 +91,20 @@ use bounded read_file calls to confirm exact text, make minimal changes with
 replace_text, and run focused pytest commands. You may edit existing production
 Python files only. Never edit tests, documentation, dependencies, or scratch
 files. Once focused tests pass, call finish instead of continuing investigation.
+"""
+PATCH_REVIEWER_PROMPT = """You are a read-only patch reviewer for a Python repair agent.
+Review the candidate patch against the issue, existing implementation, and visible
+test evidence. Look for incorrect assumptions, incomplete call-site changes, edge
+cases, and regressions. Never assume or request hidden tests. Use read_file or
+read_symbol only when the supplied patch lacks necessary context. Finish with
+review_finish. Set passed=true only when there is no concrete issue; otherwise
+return a short list of actionable issues grounded in visible evidence.
+"""
+REVISER_PROMPT = """You are the single bounded revision pass of a Python repair agent.
+Address only the reviewer's concrete issues while preserving correct parts of the
+candidate patch. Read exact symbols as needed, make the smallest credible edit,
+and run a focused visible pytest command. Never edit tests or infer hidden tests.
+Once the latest edit passes pytest, the controller will stop automatically.
 """
 
 
@@ -153,6 +171,7 @@ def compact_trace(trace: list[dict]) -> list[dict]:
             row["result_preview"] = step["result_preview"]
         for key in (
             "status", "mutation_applied", "threshold", "choice", "reason", "next_action",
+            "patch_revision", "remaining_steps",
         ):
             if key in step:
                 row[key] = step[key]
@@ -189,13 +208,13 @@ def generate_report(results_path: str | Path, report_path: str | Path) -> None:
         f"- Runs: {len(rows)}", f"- Passed: {passed}/{len(rows)}" if rows else "- Passed: 0/0",
         f"- Tokens: {tokens:,}", f"- Estimated cost: RMB {cost:.4f}",
         f"- Cumulative runtime: {elapsed / 60:.1f} minutes", "",
-        "| Case | Strategy | Trial | Passed | Completed | Modified files | Gold recall | Tokens | Cost (RMB) |",
+        "| Case | Protocol | Trial | Passed | Completed | Modified files | Gold recall | Tokens | Cost (RMB) |",
         "|---|---|---:|---:|---:|---|---:|---:|---:|",
     ]
     for row in rows:
         modified = ", ".join(f"`{path}`" for path in row["modified_files"]) or "-"
         lines.append(
-            f"| `{row['case']}` | `{row.get('strategy', 'single')}` | {row['trial']} | "
+            f"| `{row['case']}` | `{row.get('protocol_version', row.get('strategy', 'single'))}` | {row['trial']} | "
             f"{str(row['tests_pass']).lower()} | "
             f"{str(row['agent_completed']).lower()} | {modified} | "
             f"{row['gold_file_recall']:.0%} | {row['total_tokens']:,} | {row['cost_rmb']:.4f} |"
@@ -245,11 +264,12 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
                max_steps: int, planner_steps: int,
                max_tokens: int | None, max_cost_rmb: float | None = None,
                no_progress_after: int | None = None, run_state: dict | None = None,
+               auto_finish_after_verified_patch: bool = True,
                ) -> tuple[object, Usage, list[dict], bool | None, dict | None]:
     usage = Usage()
     if run_state is None:
         run_state = {}
-    if strategy == "single":
+    if strategy in {"single", "review_revise"}:
         trace: list[dict] = []
         phase_state: dict = {}
         single_tools = NO_PROGRESS_TOOLS if no_progress_after is not None else TOOLS
@@ -261,10 +281,12 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
             no_progress_prompt=(
                 no_progress_prompt(no_progress_after) if no_progress_after is not None else None
             ),
+            auto_finish_after_verified_patch=auto_finish_after_verified_patch,
         )
         run_state.update(phase_state)
-        run_state["phases"] = {"single": dict(phase_state)}
-        return result, usage, _phase(trace, "single"), None, None
+        phase_name = "code" if strategy == "review_revise" else "single"
+        run_state["phases"] = {phase_name: dict(phase_state)}
+        return result, usage, _phase(trace, phase_name), None, None
 
     planner_trace: list[dict] = []
     planner_state: dict = {}
@@ -297,19 +319,111 @@ def run_repair(client, strategy: str, task: str, executor, model: str,
         model=model, max_steps=max_steps, execute_tool=executor,
         usage=usage, trace=execution_trace, max_tokens=max_tokens,
         max_cost_rmb=max_cost_rmb, run_state=execution_state,
+        auto_finish_after_verified_patch=auto_finish_after_verified_patch,
     )
     run_state["exit_reason"] = execution_state.get("exit_reason", "unknown")
     run_state["phases"] = {"plan": planner_state, "execute": execution_state}
     return result, usage, planner_trace + _phase(execution_trace, "execute"), True, plan
 
 
+def run_review_revise(client, task: str, candidate_patch: str, visible_test_evidence: str,
+                      executor, model: str, usage: Usage, max_tokens: int | None,
+                      max_cost_rmb: float | None, reviewer_steps: int = 6,
+                      reviser_steps: int = 10,
+                      auto_finish_after_verified_patch: bool = True,
+                      run_state: dict | None = None,
+                      ) -> tuple[object, Usage, list[dict], dict, bool]:
+    """Review one candidate patch and allow at most one bounded revision.
+
+    Hidden tests and gold patches are deliberately absent.  This keeps the
+    independent evaluator valid while still testing whether a separate reviewer
+    catches semantic or regression risks from the issue, diff, and visible tests.
+    """
+    if run_state is None:
+        run_state = {}
+    review_trace: list[dict] = []
+    review_state: dict = {}
+    review_task = (
+        task.split("\n\nInitial retrieved evidence:", 1)[0]
+        + "\n\nCandidate patch produced by the coder:\n"
+        + candidate_patch
+        + "\n\nVisible test evidence (may be empty):\n"
+        + (visible_test_evidence or "No visible pytest result was recorded.")
+    )
+    review, usage = run_agent(
+        client, PATCH_REVIEWER_PROMPT, PATCH_REVIEWER_TOOLS, review_task,
+        model=model, max_steps=reviewer_steps, execute_tool=executor,
+        usage=usage, trace=review_trace, max_tokens=max_tokens,
+        max_cost_rmb=max_cost_rmb, run_state=review_state,
+        final_step_prompt=(
+            "This is the final review step. Call review_finish now using only visible evidence."
+        ),
+    )
+    if review_state.get("exit_reason") == "llm_error":
+        latest = next(
+            (step for step in reversed(review_trace) if step.get("action") == "llm_error"), {}
+        )
+        raise EvaluationInfrastructureError(
+            latest.get("error", "Reviewer LLM failure"), bool(latest.get("retryable"))
+        )
+    structured_review = review if isinstance(review, dict) else {
+        "passed": False,
+        "issues": ["Reviewer did not return a structured conclusion."],
+        "incomplete": True,
+    }
+    issues = [str(item) for item in structured_review.get("issues") or []]
+    passed = bool(structured_review.get("passed")) and not issues
+    phases = run_state.setdefault("phases", {})
+    phases["review"] = dict(review_state)
+    if passed:
+        run_state["exit_reason"] = "review_passed"
+        return review, usage, _phase(review_trace, "review"), structured_review, False
+
+    revision_trace: list[dict] = []
+    revision_state: dict = {}
+    revision_task = (
+        task.split("\n\nInitial retrieved evidence:", 1)[0]
+        + "\n\nCandidate patch:\n"
+        + candidate_patch
+        + "\n\nReviewer issues:\n"
+        + "\n".join(f"- {issue}" for issue in issues)
+    )
+    revised, usage = run_agent(
+        client, REVISER_PROMPT, REVISER_TOOLS, revision_task,
+        model=model, max_steps=reviser_steps, execute_tool=executor,
+        usage=usage, trace=revision_trace, max_tokens=max_tokens,
+        max_cost_rmb=max_cost_rmb, run_state=revision_state,
+        auto_finish_after_verified_patch=auto_finish_after_verified_patch,
+        final_step_prompt=(
+            "This is the final revision step. Run the focused pytest command if needed, "
+            "then call finish; do not start another investigation."
+        ),
+    )
+    if revision_state.get("exit_reason") == "llm_error":
+        latest = next(
+            (step for step in reversed(revision_trace) if step.get("action") == "llm_error"), {}
+        )
+        raise EvaluationInfrastructureError(
+            latest.get("error", "Reviser LLM failure"), bool(latest.get("retryable"))
+        )
+    phases["revise"] = dict(revision_state)
+    run_state["exit_reason"] = revision_state.get("exit_reason", "revision_incomplete")
+    return (
+        revised, usage,
+        _phase(review_trace, "review") + _phase(revision_trace, "revise"),
+        structured_review, True,
+    )
+
+
 def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
                  docker_binary: str, model: str, trial: int,
                  max_steps: int, max_tokens: int | None,
                  strategy: str = "single", planner_steps: int = 10,
-                 max_cost_rmb: float | None = None,
-                 no_progress_after: int | None = None,
-                 provenance: dict | None = None) -> dict:
+                  max_cost_rmb: float | None = None,
+                  no_progress_after: int | None = None,
+                  provenance: dict | None = None,
+                  auto_finish_after_verified_patch: bool = True,
+                  reviewer_steps: int = 6, reviser_steps: int = 10) -> dict:
     started = time.perf_counter()
     source = snapshot_directory(cache_root, case)
     if not source.is_dir():
@@ -343,9 +457,11 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             writable_files=editable, code_search=search,
         )
         run_state: dict = {}
+        client = make_client()
         result, usage, trace, planner_completed, repair_plan = run_repair(
-            make_client(), strategy, task, executor, model, max_steps,
+            client, strategy, task, executor, model, max_steps,
             planner_steps, max_tokens, max_cost_rmb, no_progress_after, run_state,
+            auto_finish_after_verified_patch,
         )
         llm_errors = [step for step in trace if step.get("action") == "llm_error"]
         if llm_errors:
@@ -355,7 +471,32 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             raise EvaluationInfrastructureError(
                 latest.get("error", "LLM failure"), bool(latest.get("retryable"))
             )
-        agent_completed = run_state.get("exit_reason") == "finish"
+        review = None
+        revision_attempted = False
+        if strategy == "review_revise":
+            candidate_modified = sorted(
+                path for path in editable
+                if before_editable[path] != _fingerprints(workspace, [path])[path]
+            )
+            candidate_patch = _agent_patch(source, workspace, candidate_modified)
+            visible_tests = "\n".join(
+                str(step.get("result_preview", ""))
+                for step in trace if step.get("action") == "run_command"
+            )[-2000:]
+            if candidate_patch:
+                result, usage, extra_trace, review, revision_attempted = run_review_revise(
+                    client, task, candidate_patch, visible_tests, executor, model, usage,
+                    max_tokens, max_cost_rmb, reviewer_steps, reviser_steps,
+                    auto_finish_after_verified_patch, run_state,
+                )
+                trace.extend(extra_trace)
+            else:
+                review = {"passed": False, "issues": ["Coder produced no candidate patch."],
+                          "skipped": True}
+                run_state["exit_reason"] = "no_candidate_patch"
+        agent_completed = run_state.get("exit_reason") in {
+            "finish", "verified_patch", "review_passed",
+        }
 
         after_tests = _fingerprints(workspace, test_paths)
         after_editable = _fingerprints(workspace, editable)
@@ -386,6 +527,8 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             "model": model, "image": image, "agent_completed": agent_completed,
             "planner_completed": planner_completed,
             "repair_plan": repair_plan,
+            "review": review,
+            "revision_attempted": revision_attempted,
             "tests_pass": verification.exit_code == 0,
             "test_tampered": test_tampered, "container_timeout": verification.timed_out,
             "modified_files": modified, "gold_files": list(case.production_files),
@@ -406,6 +549,7 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             "trace_schema_version": TRACE_SCHEMA_VERSION,
             "exit_reason": run_state.get("exit_reason", "unknown"),
             "run_state": run_state,
+            "completion_evidence": run_state.get("completion_evidence"),
             "trace": compact_trace(trace),
             "search_calls": 1 + sum(step.get("action") == "search_code" for step in trace),
             "initial_search_calls": 1,
@@ -452,12 +596,27 @@ def main() -> None:
     parser.add_argument("--docker-binary", default="docker")
     parser.add_argument("--max-steps", type=int, default=25)
     parser.add_argument("--planner-steps", type=int, default=10)
-    parser.add_argument("--strategy", choices=("single", "plan_execute"), default="single")
+    parser.add_argument(
+        "--strategy", choices=("single", "plan_execute", "review_revise"), default="single"
+    )
+    parser.add_argument("--reviewer-steps", type=int, default=6)
+    parser.add_argument("--reviser-steps", type=int, default=10)
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--max-cost-rmb", type=float)
     parser.add_argument(
         "--no-progress-after", type=int, default=0,
         help="inject the structured no-progress decision after N edit-free LLM turns; 0 disables",
+    )
+    finish_group = parser.add_mutually_exclusive_group()
+    finish_group.add_argument(
+        "--auto-finish-verified-patch", dest="auto_finish_verified_patch",
+        action="store_true", default=True,
+        help="let the controller stop after the latest mutation passes a pytest command",
+    )
+    finish_group.add_argument(
+        "--no-auto-finish-verified-patch", dest="auto_finish_verified_patch",
+        action="store_false",
+        help="require the model to call finish even after a verified mutation",
     )
     parser.add_argument("--protocol-dir", default="benchmark/real/protocols")
     parser.add_argument(
@@ -469,8 +628,9 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     if (args.trials < 1 or args.max_steps < 1 or args.planner_steps < 1
+            or args.reviewer_steps < 1 or args.reviser_steps < 1
             or args.no_progress_after < 0):
-        parser.error("trials, max-steps and planner-steps must be positive")
+        parser.error("trials and all stage step budgets must be positive")
 
     selected = load_manifest(args.manifest, args.cases_file)
 
@@ -489,6 +649,24 @@ def main() -> None:
             "executor": EXECUTOR_PROMPT,
         }
         active_tools = {"planner": PLANNER_TOOLS.schemas(), "executor": EXECUTOR_TOOLS.schemas()}
+    elif args.strategy == "review_revise":
+        active_prompts = {
+            "coder": PROMPT,
+            "reviewer": PATCH_REVIEWER_PROMPT,
+            "reviewer_final_step": (
+                "This is the final review step. Call review_finish now using only visible evidence."
+            ),
+            "reviser": REVISER_PROMPT,
+            "reviser_final_step": (
+                "This is the final revision step. Run the focused pytest command if needed, "
+                "then call finish; do not start another investigation."
+            ),
+        }
+        active_tools = {
+            "coder": NO_PROGRESS_TOOLS.schemas() if no_progress_after else TOOLS.schemas(),
+            "reviewer": PATCH_REVIEWER_TOOLS.schemas(),
+            "reviser": REVISER_TOOLS.schemas(),
+        }
     elif no_progress_after is not None:
         active_prompts["no_progress"] = no_progress_prompt(no_progress_after)
     definition = build_agent_protocol(
@@ -507,8 +685,22 @@ def main() -> None:
                 "targeted_read": ["read_file", "read_symbol"],
             },
         },
+        completion_policy={
+            "auto_finish_after_verified_patch": args.auto_finish_verified_patch,
+            "requires_successful_mutation": True,
+            "accepted_verification": "pytest-exit-zero-after-latest-mutation",
+            "hidden_tests_used_for_control": False,
+        },
+        stage_budgets={
+            "coder_or_executor_steps": args.max_steps,
+            "planner_steps": args.planner_steps if args.strategy == "plan_execute" else 0,
+            "reviewer_steps": args.reviewer_steps if args.strategy == "review_revise" else 0,
+            "reviser_steps": args.reviser_steps if args.strategy == "review_revise" else 0,
+            "max_revision_passes": 1 if args.strategy == "review_revise" else 0,
+        },
     )
-    version = f"{args.strategy}-v2-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"
+    finish_mode = "verified-auto" if args.auto_finish_verified_patch else "model-finish"
+    version = f"{args.strategy}-v3-{finish_mode}-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"
     agent_protocol = protocol_record(definition, version)
     evaluation_protocol = build_evaluation_protocol(
         manifest_path=args.manifest, cases_path=args.cases_file,
@@ -568,6 +760,8 @@ def main() -> None:
                                 args.model, trial, args.max_steps, args.max_tokens,
                                 args.strategy, args.planner_steps, args.max_cost_rmb,
                                 no_progress_after, provenance,
+                                args.auto_finish_verified_patch,
+                                args.reviewer_steps, args.reviser_steps,
                             )
                             break
                         except EvaluationInfrastructureError as exc:

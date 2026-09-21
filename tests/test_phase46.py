@@ -6,10 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from benchmark.analyze_real_results import analyze, classify_run, load_enriched_results
+from benchmark.real_run import run_review_revise
 from benchmark.protocol import build_agent_protocol, canonical_hash, git_state
 from core.agent import run_agent
 from core.symbols import read_symbol_source
-from core.tools import build_tool_registry
+from core.tools import ToolResult, build_tool_registry
+from core.usage import Usage
 
 
 def _tool_response(name, arguments, call_id):
@@ -94,6 +96,148 @@ def test_no_progress_does_not_trigger_before_threshold():
     assert result == "done"
     assert not any(item["action"] == "no_progress_intervention" for item in trace)
     assert state["exit_reason"] == "finish"
+
+
+def test_controller_finishes_when_latest_patch_passes_pytest():
+    responses = [
+        _tool_response(
+            "replace_text", {"path": "pkg.py", "old": "bad", "new": "good"}, "edit"
+        ),
+        _tool_response(
+            "run_command", {"argv": ["python", "-m", "pytest", "-q"]}, "test"
+        ),
+    ]
+    trace, state = [], {}
+
+    def executor(name, _args):
+        if name == "replace_text":
+            return ToolResult("updated", "ok", {"mutation_applied": True})
+        return ToolResult(
+            "1 passed", "ok", {"command_exit_code": 0, "command_succeeded": True}
+        )
+
+    result, _ = run_agent(
+        _client(responses), "system",
+        build_tool_registry("replace_text", "run_command", "finish"),
+        "task", max_steps=5, execute_tool=executor, trace=trace, run_state=state,
+        auto_finish_after_verified_patch=True,
+    )
+    assert result["auto_finished"] is True
+    assert state["exit_reason"] == "verified_patch"
+    assert state["patch_state"]["latest_patch_verified"] is True
+    assert state["budget_state"]["remaining_steps"] == 3
+    assert trace[-1]["action"] == "controller_finish"
+
+
+def test_controller_does_not_finish_on_test_before_or_failure_after_edit():
+    responses = [
+        _tool_response(
+            "run_command", {"argv": ["python", "-m", "pytest", "-q"]}, "pre-test"
+        ),
+        _tool_response(
+            "replace_text", {"path": "pkg.py", "old": "bad", "new": "good"}, "edit"
+        ),
+        _tool_response(
+            "run_command", {"argv": ["python", "-m", "pytest", "-q"]}, "failed-test"
+        ),
+        _tool_response("finish", {"result": "manual"}, "finish"),
+    ]
+
+    def executor(name, _args):
+        if name == "replace_text":
+            return ToolResult("updated", "ok", {"mutation_applied": True})
+        exit_code = 0 if _args.get("argv") and not hasattr(executor, "tested") else 1
+        executor.tested = True
+        return ToolResult("tests", "ok", {"command_exit_code": exit_code})
+
+    state = {}
+    result, _ = run_agent(
+        _client(responses), "system",
+        build_tool_registry("replace_text", "run_command", "finish"),
+        "task", max_steps=5, execute_tool=executor, run_state=state,
+        auto_finish_after_verified_patch=True,
+    )
+    assert result == "manual"
+    assert state["exit_reason"] == "finish"
+    assert state["patch_state"]["latest_patch_verified"] is False
+
+
+def test_controller_rejects_collect_only_as_completion_evidence():
+    responses = [
+        _tool_response(
+            "replace_text", {"path": "pkg.py", "old": "bad", "new": "good"}, "edit"
+        ),
+        _tool_response(
+            "run_command",
+            {"argv": ["python", "-m", "pytest", "--collect-only", "-q"]},
+            "collect",
+        ),
+        _tool_response("finish", {"result": "manual"}, "finish"),
+    ]
+
+    def executor(name, _args):
+        if name == "replace_text":
+            return ToolResult("updated", "ok", {"mutation_applied": True})
+        return ToolResult("collected", "ok", {"command_exit_code": 0})
+
+    state = {}
+    result, _ = run_agent(
+        _client(responses), "system",
+        build_tool_registry("replace_text", "run_command", "finish"),
+        "task", max_steps=4, execute_tool=executor, run_state=state,
+        auto_finish_after_verified_patch=True,
+    )
+    assert result == "manual"
+    assert "completion_evidence" not in state
+
+
+def test_patch_reviewer_can_trigger_one_bounded_revision():
+    responses = [
+        _tool_response(
+            "review_finish", {"passed": False, "issues": ["preserve zero values"]}, "review"
+        ),
+        _tool_response(
+            "replace_text", {"path": "pkg.py", "old": "if value:", "new": "if value is not None:"},
+            "revise",
+        ),
+        _tool_response(
+            "run_command", {"argv": ["python", "-m", "pytest", "-q"]}, "test"
+        ),
+    ]
+
+    def executor(name, _args):
+        if name == "replace_text":
+            return ToolResult("updated", "ok", {"mutation_applied": True})
+        if name == "run_command":
+            return ToolResult("1 passed", "ok", {"command_exit_code": 0})
+        return "ok"
+
+    state = {"phases": {"code": {"exit_reason": "finish"}}}
+    result, _, trace, review, revised = run_review_revise(
+        _client(responses), "Repository: owner/repo\nIssue: keep zero",
+        "--- a/pkg.py\n+++ b/pkg.py\n-if value is None:\n+if value:\n",
+        "1 passed", executor, "test-model", Usage(), None, None,
+        reviewer_steps=2, reviser_steps=3, run_state=state,
+    )
+    assert revised is True and review["passed"] is False
+    assert result["auto_finished"] is True
+    assert [item["phase"] for item in trace] == ["review", "revise", "revise", "revise"]
+    assert state["exit_reason"] == "verified_patch"
+
+
+def test_patch_reviewer_pass_skips_reviser():
+    responses = [
+        _tool_response("review_finish", {"passed": True, "issues": []}, "review")
+    ]
+    state = {"phases": {}}
+    _, _, trace, review, revised = run_review_revise(
+        _client(responses), "Repository: owner/repo\nIssue: fix",
+        "--- a/pkg.py\n+++ b/pkg.py\n-old\n+new\n", "1 passed",
+        lambda *_: "ok", "test-model", Usage(), None, None, run_state=state,
+    )
+    assert review == {"passed": True, "issues": []}
+    assert revised is False and state["exit_reason"] == "review_passed"
+    assert all(item["phase"] == "review" for item in trace)
 
 
 def test_progress_decision_tool_is_hidden_until_intervention():
@@ -201,6 +345,11 @@ def test_protocol_hash_changes_with_behavior_not_external_revision():
     assert canonical_hash(first) == canonical_hash(build_agent_protocol(**kwargs))
     changed = build_agent_protocol(**{**kwargs, "max_steps": 26})
     assert canonical_hash(first) != canonical_hash(changed)
+    completion_changed = build_agent_protocol(**{
+        **kwargs,
+        "completion_policy": {"auto_finish_after_verified_patch": True},
+    })
+    assert canonical_hash(first) != canonical_hash(completion_changed)
     assert "code_revision" not in first
 
 

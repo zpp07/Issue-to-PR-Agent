@@ -14,7 +14,7 @@ import shutil
 import subprocess
 from typing import Sequence
 
-from core.tools import COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT
+from core.tools import COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT, ToolResult
 
 
 class DockerUnavailable(RuntimeError):
@@ -145,7 +145,15 @@ class DockerSandbox:
 
         def runner(argv, cwd=None, timeout=COMMAND_TIMEOUT):
             result = self.run(workspace, argv, workdir=cwd or workspace, timeout=timeout)
-            return result.output
+            return ToolResult(
+                result.output,
+                "error" if result.timed_out else "ok",
+                {
+                    "command_exit_code": result.exit_code,
+                    "command_succeeded": result.exit_code == 0,
+                    "command_timed_out": result.timed_out,
+                },
+            )
 
         return runner
 

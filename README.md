@@ -1,18 +1,43 @@
-# Local Issue-to-PR Agent
+# Issue-to-PR Agent
 
-从 Coder + Reviewer demo 演化而来的**可审批、可审计、容器隔离、可评测**的本地
-Issue-to-PR Agent。仓库已自包含 `core/`、服务入口、测试、Docker 与 benchmark；clone 后
-不依赖父目录代码。
+[![CI](https://github.com/zpp07/Issue-to-PR-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/zpp07/Issue-to-PR-Agent/actions/workflows/ci.yml)
 
-## 核心目标
+一个面向真实 Python 仓库的本地代码修复 Agent：把 GitHub Issue 转换为**经过隔离测试、
+人工审批且可追溯的候选补丁**。项目重点不是堆叠 Agent 角色，而是验证长链路系统中更难的
+问题：补丁是否真的正确、Agent 为什么失败、执行权限如何收敛，以及一次修复花费了多少资源。
 
-不是重复 demo，而是回答三个能被面试官/审稿人问到的问题：
+> 当前定位：求职作品级研究原型，不是无人监管的生产机器人。系统默认不会推送代码或创建
+> GitHub PR；外部写操作必须经过明确审批。
 
-1. **这个 agent 真的修好了吗？** → pytest 独立验证，不信任 agent 自说自话
-2. **它花了多少资源？** → token / 成本的全程统计
-3. **它有没有作弊 / 沙箱逃逸？** → 篡改测试检测 + 源文件污染检测
+## 30 秒看懂项目
 
-## 快速开始
+```mermaid
+flowchart LR
+    A[GitHub Issue] --> B[仓库检索与代码定位]
+    B --> C[结构化修复计划]
+    C --> D{人工审批}
+    D -->|批准| E[Docker 内修改与公开测试]
+    D -->|拒绝| X[停止并记录]
+    E --> F[独立隐藏测试]
+    F --> G[Trace / 成本 / 失败分类]
+    G --> H{Diff 审批}
+    H -->|批准| I[PR-ready]
+```
+
+| 能力 | 当前实现 | 可验证证据 |
+|---|---|---|
+| 可靠执行 | 超时、重试、token/成本/步数预算 | `core/client.py`、`core/agent.py` |
+| 安全边界 | 无网络、非 root、只读容器根、写入 allowlist | `core/sandbox.py`、`core/policy.py` |
+| 人工监督 | 计划与 diff 审批绑定精确 SHA-256 | `core/workflow.py` |
+| 仓库理解 | BM25 + 向量召回 + 重排 + symbol 级读取 | `core/search.py`、`core/symbols.py` |
+| 可审计记忆 | 只保存带来源和文件哈希的事实 | `core/memory.py` |
+| 实证评测 | toy/harder/真实仓库三层 benchmark | `benchmark/` |
+
+截至 2026-09-21，确定性测试基线为 **60 passed**。真实仓库历史账本包含 11 次混合协议
+运行；项目明确保留 Multi-Agent、RAG 和无进展干预未带来稳定收益的负面结果，不把小样本
+包装成能力提升。
+
+## 快速开始（无需 API key）
 
 ```powershell
 python -m venv .venv
@@ -20,6 +45,18 @@ python -m venv .venv
 python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 python -m pytest
+```
+
+上述命令只验证本地控制逻辑，不会调用付费模型。完整的 3～5 分钟演示路线、讲解词和预期
+输出见 [`docs/DEMO.md`](docs/DEMO.md)。
+
+## 运行一次隔离修复
+
+启动 Docker Desktop，并在本地 `.env` 中配置模型后：
+
+```powershell
+docker build -t issue-to-pr-runner:phase3 -f docker\Dockerfile .
+python -m benchmark.run --cases case01_add --methods single
 ```
 
 运行真实模型任务前，在本地 `.env` 中填写 `DEEPSEEK_API_KEY`；该文件已被 Git 忽略。
@@ -149,12 +186,25 @@ python -m benchmark.analyze_real_results --show-provenance
 ```
 
 新运行会记录 `protocol_hash`、`code_revision`、`trace_schema_version`、工具状态和
-`exit_reason`。任何新的付费真实模型实验仍需单独批准。
+`exit_reason`。付费实验遵守用户批准的累计 5,000 万 token 上限，并在实验报告中登记实际
+用量；外部 GitHub 写操作仍需单独审批。
 
 2026-09-21 的 W5 off/on smoke 共运行 4 次、消耗 1,522,365 tokens：Pydantic off/on
 都通过但都跑满 25 步，on 的首次成功修改反而从 step 13 推迟到 step 23；DVC 回归为
 1/2。结论是**不默认启用 W5**，并保留这个负结果。详见
 [`benchmark/real/experiments/E1_NO_PROGRESS_REPORT.md`](benchmark/real/experiments/E1_NO_PROGRESS_REPORT.md)。
+
+### 当前控制回路（待真实实验验证）
+
+- 控制器跟踪补丁版本、成功修改、pytest 退出码和剩余预算；只有“最新补丁在修改后通过
+  pytest”才会确定性结束，不再依赖模型额外调用 `finish`。
+- `review_revise` 策略在 Coder 产生候选补丁后执行只读 Reviewer；Reviewer 只能使用
+  Issue、候选 diff、公开测试证据和仓库源码，发现具体问题时最多触发一次受预算限制的
+  Reviser。
+- hidden tests 和 gold patch 始终不进入 Reviewer/Reviser 上下文，只由最终 evaluator 使用，
+  避免通过评测反馈迭代补丁造成 benchmark 泄漏。
+
+以上机制已经过离线单元测试，但在 E2 同协议重复实验完成前，不宣称能够提升真实任务成功率。
 
 ## Phase 5：有来源的任务记忆
 
@@ -312,4 +362,7 @@ python experiment.py --cases case01_add --methods mreview,self
 - [x] 新增跨文件、需检索、契约更复杂的 harder suite
 - [x] 完成 browse / hybrid 第二轮消融并保留负面结果
 - [x] 增加有来源、可失效的任务记忆
-- [ ] Phase 6：受审批的 commit / PR body / GitHub PR 创建与技术报告
+- [x] 基于补丁版本和 pytest 结果的确定性终止控制
+- [x] 候选补丁之后的一次 Reviewer + Reviser 闭环（不接触 hidden tests）
+- [ ] 完成 E2 同协议重复实验并报告置信区间与负面结果
+- [ ] 受审批的 commit / PR body / GitHub Draft PR 创建与技术报告

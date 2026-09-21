@@ -48,6 +48,8 @@ def build_agent_protocol(
     max_cost_rmb: float | None,
     search_budget: int,
     no_progress: dict[str, Any],
+    completion_policy: dict[str, Any] | None = None,
+    stage_budgets: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Return the canonical behavior definition used by ``protocol_hash``."""
     return {
@@ -91,6 +93,10 @@ def build_agent_protocol(
             "command_policy": "pytest-and-ruff-no-shell",
         },
         "no_progress": no_progress,
+        "completion_policy": completion_policy or {
+            "auto_finish_after_verified_patch": False,
+        },
+        "stage_budgets": stage_budgets or {},
     }
 
 

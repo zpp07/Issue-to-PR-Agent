@@ -9,8 +9,8 @@ from benchmark.catalog import CASES
 from benchmark.dashboard import render
 from benchmark.dataset import materialize
 from core.agent import run_agent
-from core.sandbox import DockerLimits, DockerSandbox, DockerUnavailable
-from core.tools import build_tool_registry, make_executor
+from core.sandbox import DockerLimits, DockerSandbox, DockerUnavailable, SandboxResult
+from core.tools import ToolResult, build_tool_registry, make_executor
 
 
 def test_catalog_has_20_plus_compilable_separated_cases(tmpdir):
@@ -55,6 +55,17 @@ def test_hidden_verifier_mounts_both_inputs_read_only(tmpdir):
     mounts = [argv[index + 1] for index, value in enumerate(argv[:-1]) if value == "--mount"]
     assert any("dst=/workspace,readonly" in mount for mount in mounts)
     assert any("dst=/hidden,readonly" in mount for mount in mounts)
+
+
+def test_docker_command_runner_preserves_exit_code_metadata(tmpdir, monkeypatch):
+    workspace = Path(str(tmpdir)) / "workspace"
+    workspace.mkdir()
+    sandbox = DockerSandbox()
+    monkeypatch.setattr(sandbox, "run", lambda *args, **kwargs: SandboxResult(1, "1 failed"))
+    result = sandbox.command_runner(workspace)(["python", "-m", "pytest", "-q"])
+    assert isinstance(result, ToolResult)
+    assert result.metadata["command_exit_code"] == 1
+    assert result.metadata["command_succeeded"] is False
 
 
 def test_missing_docker_never_falls_back(monkeypatch):
