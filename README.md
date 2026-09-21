@@ -151,6 +151,11 @@ python -m benchmark.analyze_real_results --show-provenance
 新运行会记录 `protocol_hash`、`code_revision`、`trace_schema_version`、工具状态和
 `exit_reason`。任何新的付费真实模型实验仍需单独批准。
 
+2026-09-21 的 W5 off/on smoke 共运行 4 次、消耗 1,522,365 tokens：Pydantic off/on
+都通过但都跑满 25 步，on 的首次成功修改反而从 step 13 推迟到 step 23；DVC 回归为
+1/2。结论是**不默认启用 W5**，并保留这个负结果。详见
+[`benchmark/real/experiments/E1_NO_PROGRESS_REPORT.md`](benchmark/real/experiments/E1_NO_PROGRESS_REPORT.md)。
+
 ## Phase 5：有来源的任务记忆
 
 `core/memory.py` 只允许四类持久化内容：逐字文件事实、已批准计划中的测试命令、测试失败、

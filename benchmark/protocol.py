@@ -113,11 +113,17 @@ def git_state(repo_root: str | Path) -> dict[str, Any]:
 
     revision = git("rev-parse", "HEAD")
     dirty_output = git("status", "--porcelain", "--untracked-files=all")
+    status_lines = dirty_output.splitlines()
+    tracked_dirty = any(not line.startswith("??") for line in status_lines)
+    untracked_count = sum(line.startswith("??") for line in status_lines)
     record: dict[str, Any] = {
         "code_revision": revision,
         "worktree_dirty": bool(dirty_output),
+        "tracked_worktree_dirty": tracked_dirty,
+        "untracked_files_present": bool(untracked_count),
+        "untracked_file_count": untracked_count,
     }
-    if dirty_output:
+    if tracked_dirty:
         tracked_diff = subprocess.run(
             ["git", "-C", str(root), "diff", "--binary", "HEAD"], check=True,
             capture_output=True,

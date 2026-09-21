@@ -1,11 +1,12 @@
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 
 from benchmark.analyze_real_results import analyze, classify_run, load_enriched_results
-from benchmark.protocol import build_agent_protocol, canonical_hash
+from benchmark.protocol import build_agent_protocol, canonical_hash, git_state
 from core.agent import run_agent
 from core.symbols import read_symbol_source
 from core.tools import build_tool_registry
@@ -95,6 +96,64 @@ def test_no_progress_does_not_trigger_before_threshold():
     assert state["exit_reason"] == "finish"
 
 
+def test_progress_decision_tool_is_hidden_until_intervention():
+    calls = []
+    responses = [
+        _tool_response("read_file", {"path": "pkg.py"}, "read"),
+        _tool_response("progress_decision", {
+            "choice": "finish", "reason": "enough investigation",
+        }, "decision"),
+    ]
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    run_agent(
+        client, "system", build_tool_registry("read_file", "progress_decision", "finish"),
+        "task", max_steps=3, execute_tool=lambda *_: "ok", no_progress_after=1,
+    )
+    first = {item["function"]["name"] for item in calls[0]["tools"]}
+    second = {item["function"]["name"] for item in calls[1]["tools"]}
+    assert "progress_decision" not in first
+    assert "progress_decision" in second
+
+
+def test_targeted_read_choice_rejects_search_before_one_bounded_read():
+    responses = [
+        _tool_response("read_file", {"path": "pkg.py"}, "read-0"),
+        _tool_response("progress_decision", {
+            "choice": "targeted_read", "reason": "need the exact symbol",
+        }, "decision"),
+        _tool_response("search_code", {"query": "broad retry"}, "rejected-search"),
+        _tool_response("read_symbol", {"path": "pkg.py", "symbol": "target"}, "bounded-read"),
+        _tool_response("finish", {"result": "done"}, "finish"),
+    ]
+    executed = []
+
+    def executor(name, _args):
+        executed.append(name)
+        return "ok"
+
+    trace, state = [], {}
+    result, _ = run_agent(
+        _client(responses), "system",
+        build_tool_registry(
+            "search_code", "read_file", "read_symbol", "progress_decision", "finish"
+        ),
+        "task", max_steps=6, execute_tool=executor, trace=trace,
+        run_state=state, no_progress_after=1,
+    )
+    event = next(item for item in trace if item["action"] == "no_progress_intervention")
+    rejected = next(item for item in trace if item["action"] == "search_code")
+    assert result == "done"
+    assert "search_code" not in executed
+    assert rejected["status"] == "rejected"
+    assert event["rejected_next_actions"] == ["search_code"]
+    assert event["next_action"] == "read_symbol"
+
+
 def test_read_symbol_handles_qualified_nested_decorated_and_ambiguous(tmpdir):
     path = Path(str(tmpdir)) / "sample.py"
     path.write_text(
@@ -143,6 +202,27 @@ def test_protocol_hash_changes_with_behavior_not_external_revision():
     changed = build_agent_protocol(**{**kwargs, "max_steps": 26})
     assert canonical_hash(first) != canonical_hash(changed)
     assert "code_revision" not in first
+
+
+def test_git_state_distinguishes_generated_untracked_files_from_code_changes(tmpdir):
+    root = Path(str(tmpdir)) / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
+    tracked = root / "tracked.txt"
+    tracked.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
+    subprocess.run([
+        "git", "-C", str(root), "-c", "user.name=Test", "-c",
+        "user.email=test@example.invalid", "commit", "-m", "base",
+    ], check=True, capture_output=True)
+    (root / "result.jsonl").write_text("{}\n", encoding="utf-8")
+    generated = git_state(root)
+    assert generated["worktree_dirty"]
+    assert not generated["tracked_worktree_dirty"]
+    assert generated["untracked_files_present"]
+    tracked.write_text("changed\n", encoding="utf-8")
+    changed = git_state(root)
+    assert changed["tracked_worktree_dirty"] and "tracked_diff_hash" in changed
 
 
 def test_legacy_provenance_and_failure_summary_match_audit():

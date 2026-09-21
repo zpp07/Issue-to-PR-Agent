@@ -501,6 +501,11 @@ def main() -> None:
             "after_llm_turns": no_progress_after,
             "max_triggers": 1,
             "applies_to": "single-before-first-successful-mutation",
+            "decision_tool_visibility": "only-after-trigger",
+            "next_action_enforcement": {
+                "minimal_edit": ["replace_text", "write_file"],
+                "targeted_read": ["read_file", "read_symbol"],
+            },
         },
     )
     version = f"{args.strategy}-v2-{'np9' if no_progress_after == 9 else 'np-custom' if no_progress_after else 'np-off'}"

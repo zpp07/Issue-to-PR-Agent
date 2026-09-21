@@ -115,6 +115,7 @@ def run_agent(
 
     successful_mutation = False
     intervention = None
+    pending_direction = None
 
     run_id = uuid.uuid4().hex[:8]
     log.info("run_agent 开始 run_id=%s model=%s max_steps=%s max_tokens=%s",
@@ -143,8 +144,14 @@ def run_agent(
         if final_step_prompt and step == max_steps - 1:
             messages.append({"role": "user", "content": final_step_prompt})
         try:
+            visible_tools = tools.schemas()
+            if intervention is None:
+                visible_tools = [
+                    schema for schema in visible_tools
+                    if schema.get("function", {}).get("name") != "progress_decision"
+                ]
             message, (pt, ct), request_id, provider_request_id = _llm_call(
-                client, messages, tools.schemas(), model
+                client, messages, visible_tools, model
             )
         except LLMCallError as exc:
             log.error("LLM 调用失败 run_id=%s retryable=%s: %s", run_id, exc.retryable, exc)
@@ -195,10 +202,32 @@ def run_agent(
             else:
                 trace_record = None
 
-            try:
-                result = execute_tool(name, args)
-            except Exception as e:
-                result = f"工具执行出错：{e}"
+            rejected_by_intervention = False
+            if intervention is not None and name != "progress_decision":
+                allowed = {
+                    "minimal_edit": {"replace_text", "write_file"},
+                    "targeted_read": {"read_file", "read_symbol"},
+                }.get(pending_direction)
+                if "choice" not in intervention:
+                    result = "拒绝操作：请先调用 progress_decision 做结构化选择"
+                    rejected_by_intervention = True
+                elif allowed is not None and name not in allowed:
+                    result = (
+                        f"拒绝操作：你选择了 {pending_direction}，下一步只允许 "
+                        f"{', '.join(sorted(allowed))}"
+                    )
+                    rejected_by_intervention = True
+                else:
+                    try:
+                        result = execute_tool(name, args)
+                    except Exception as e:
+                        result = f"工具执行出错：{e}"
+                    pending_direction = None
+            else:
+                try:
+                    result = execute_tool(name, args)
+                except Exception as e:
+                    result = f"工具执行出错：{e}"
 
             structured_result = normalize_tool_result(result, name)
 
@@ -215,15 +244,11 @@ def run_agent(
                 ):
                     trace_record["result_preview"] = rendered[:300]
 
-            if (intervention is not None and "next_action" not in intervention
-                    and name != "progress_decision"):
-                intervention["next_action"] = name
-                if "choice" not in intervention:
-                    intervention["choice"] = (
-                        "minimal_edit" if name in {"replace_text", "write_file"}
-                        else "targeted_read" if name in {"read_file", "read_symbol", "search_code"}
-                        else "finish" if name == "finish" else "other"
-                    )
+            if (intervention is not None and name != "progress_decision"):
+                if rejected_by_intervention:
+                    intervention.setdefault("rejected_next_actions", []).append(name)
+                elif "next_action" not in intervention:
+                    intervention["next_action"] = name
 
             if name == "progress_decision":
                 choice = args.get("choice")
@@ -237,6 +262,8 @@ def run_agent(
                 else:
                     intervention["choice"] = choice
                     intervention["reason"] = str(args.get("reason", ""))[:300]
+                    if choice in {"minimal_edit", "targeted_read"}:
+                        pending_direction = choice
                 if intervention is not None and choice in {"abandon", "finish"}:
                     set_exit("no_progress")
                     return {
