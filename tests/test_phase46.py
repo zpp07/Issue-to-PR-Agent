@@ -117,6 +117,20 @@ def test_read_symbol_handles_qualified_nested_decorated_and_ambiguous(tmpdir):
     assert "return 2" in selected["source"]
 
 
+def test_read_symbol_accepts_newer_positional_only_syntax_on_old_runtime(tmpdir):
+    path = Path(str(tmpdir)) / "modern.py"
+    path.write_text(
+        "def outer(value, /):\n"
+        "    def inner(item, /, *, flag=True):\n"
+        "        return item\n"
+        "    return inner(value)\n",
+        encoding="utf-8",
+    )
+    result = read_symbol_source(path, "outer.inner", context_lines=0)
+    assert result["status"] == "ok"
+    assert "def inner(item, /, *, flag=True):" in result["source"]
+
+
 def test_protocol_hash_changes_with_behavior_not_external_revision():
     kwargs = dict(
         strategy="single", model="model", prompts={"single": "prompt"},

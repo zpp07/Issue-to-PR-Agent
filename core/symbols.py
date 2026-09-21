@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,24 @@ class _SymbolVisitor(ast.NodeVisitor):
 
 
 def index_python_symbols(source: str) -> list[SymbolLocation]:
-    tree = ast.parse(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # The project still supports Python 3.7 for dependency-light local
+        # runs, while target repositories may use Python 3.8 positional-only
+        # markers.  Replacing only the standalone marker in the parse copy
+        # preserves line numbers and never changes repository source.
+        compatible = re.sub(
+            r"(?m)(?<=,)[ \t]*/[ \t]*,",
+            lambda match: " " * len(match.group(0)),
+            source,
+        )
+        compatible = re.sub(
+            r"(?m)(?<=,)([ \t]*)/(?=[ \t]*\))", r"\1 ", compatible,
+        )
+        if compatible == source:
+            raise
+        tree = ast.parse(compatible)
     visitor = _SymbolVisitor()
     visitor.visit(tree)
     return visitor.locations
