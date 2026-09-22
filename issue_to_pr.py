@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from core.agent import run_agent
+from core.github import GitHubAPI
 from core.policy import CommandPolicy
 from core.search import build_code_search
 from core.tools import build_tool_registry, make_executor
@@ -53,6 +54,22 @@ class IssueToPRService:
         context = self.workflow.create_task(repo_path, issue)
         plan, plan_hash = self.plan_existing(context.task_id)
         return context, plan, plan_hash
+
+    def create_from_github_issue(
+        self, repo_path: str | Path, repository: str, issue_number: int,
+        github: GitHubAPI | None = None,
+    ) -> tuple[TaskContext, dict[str, Any], str, dict[str, Any]]:
+        issue = (github or GitHubAPI.from_env()).get_issue(repository, issue_number)
+        issue_text = (
+            f"GitHub Issue {issue['repository']}#{issue['number']}: {issue['title']}\n\n"
+            f"{issue['body']}\n\nSource: {issue['html_url']}"
+        ).strip()
+        context, plan, plan_hash = self.create_and_plan(repo_path, issue_text)
+        self.workflow.store.event(context.task_id, "github_issue_imported", {
+            "repository": issue["repository"], "number": issue["number"],
+            "html_url": issue["html_url"], "state": issue["state"],
+        })
+        return context, plan, plan_hash, issue
 
     def plan_existing(self, task_id: str) -> tuple[dict[str, Any], str]:
         task = self.workflow.store.task(task_id)

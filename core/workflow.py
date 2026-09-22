@@ -5,10 +5,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 from typing import Any
 
 from core.audit import TaskStore
+from core.github import GitHubAPI, GitHubDraftPRPublisher, validate_branch, validate_repository
 from core.memory import TaskMemory
 from core.policy import CommandPolicy
 from core.tools import make_executor
@@ -36,8 +38,8 @@ class TaskContext:
 class IssueToPRWorkflow:
     """Explicit state transitions and immutable approval subjects.
 
-    The workflow never commits or pushes.  A later integration may do so only
-    after the exact reviewed diff has been approved.
+    Commit/push/Draft-PR publication is available only after the exact reviewed
+    diff and an exact publication request receive separate approvals.
     """
 
     def __init__(self, store: TaskStore, workspace_root: str | Path):
@@ -174,3 +176,152 @@ class IssueToPRWorkflow:
         approval = self.store.approve(task_id, "diff", review_hash, decision, actor, reason)
         self.store.set_status(task_id, "approved_for_pr" if decision == "approved" else "diff_rejected")
         self.memory.capture_approval(approval)
+
+    def prepare_draft_pr(
+        self, task_id: str, *, repository: str, base_branch: str,
+        head_branch: str, title: str, body: str | None = None,
+        remote: str = "origin", commit_message: str | None = None,
+    ) -> dict[str, Any]:
+        """Freeze an exact publication request without changing Git or GitHub state."""
+        task = self.store.task(task_id)
+        if task["status"] not in {"approved_for_pr", "publish_rejected"}:
+            raise RuntimeError("任务尚未获得 diff 审批")
+        review_artifact = self.store.latest_artifact(task_id, "diff_review")
+        if not self.store.is_approved(task_id, "diff", review_artifact["sha256"]):
+            raise RuntimeError("当前 diff/test 组合没有有效审批")
+        review = json.loads(review_artifact["content"])
+        diff_artifact = self.store.latest_artifact(task_id, "diff")
+        current_diff = _git(
+            Path(task["workspace_path"]),
+            ["diff", "--no-ext-diff", "--binary", task["base_commit"]],
+        )
+        current_hash = _digest(current_diff)
+        if not current_diff or current_hash != diff_artifact["sha256"] or current_hash != review["diff_sha256"]:
+            raise ValueError("当前 worktree diff 与已审批对象不一致")
+
+        repository = validate_repository(repository)
+        base_branch, head_branch = validate_branch(base_branch), validate_branch(head_branch)
+        if not re_fullmatch_remote(remote):
+            raise ValueError("remote 名称不合法")
+        title = " ".join(title.split()).strip()
+        if not title or len(title) > 256:
+            raise ValueError("PR title 必须为 1–256 个字符")
+        commit_message = " ".join((commit_message or title).split()).strip()
+        if not commit_message or len(commit_message) > 256:
+            raise ValueError("commit message 必须为 1–256 个字符")
+        if body is None:
+            plan = json.loads(self.store.latest_artifact(task_id, "plan")["content"])
+            test_report = self.store.latest_artifact(task_id, "test_report")["content"].strip()
+            body = (
+                "## Summary\n\n"
+                f"{plan['goal']}\n\n"
+                "## Validation\n\n"
+                f"```text\n{test_report[:4000]}\n```\n\n"
+                "## Audit\n\n"
+                f"- Base commit: `{task['base_commit']}`\n"
+                f"- Approved diff SHA-256: `{current_hash}`\n"
+                f"- Test report SHA-256: `{review['test_report_sha256']}`\n"
+            )
+        if not isinstance(body, str) or not body.strip() or len(body) > 65_000:
+            raise ValueError("PR body 必须为 1–65000 个字符")
+
+        request = {
+            "schema_version": 1,
+            "repository": repository,
+            "remote": remote,
+            "base_branch": base_branch,
+            "head_branch": head_branch,
+            "title": title,
+            "body": body,
+            "commit_message": commit_message,
+            "draft": True,
+            "base_commit": task["base_commit"],
+            "diff_review_sha256": review_artifact["sha256"],
+            "diff_sha256": current_hash,
+            "test_report_sha256": review["test_report_sha256"],
+        }
+        request_hash = _digest(request)
+        self.store.artifact(
+            task_id, "draft_pr_request",
+            json.dumps(request, ensure_ascii=False, indent=2, sort_keys=True), request_hash,
+        )
+        self.store.set_status(task_id, "awaiting_publish_approval")
+        self.store.event(task_id, "draft_pr_request_ready", {
+            "request_sha256": request_hash, "repository": repository,
+            "base_branch": base_branch, "head_branch": head_branch, "draft": True,
+        })
+        return {"request_sha256": request_hash, "request": request}
+
+    def approve_publish(self, task_id: str, request_hash: str, actor: str,
+                        decision: str, reason: str | None = None) -> None:
+        task = self.store.task(task_id)
+        if task["status"] != "awaiting_publish_approval":
+            raise RuntimeError("任务不在发布审批状态")
+        request = self.store.latest_artifact(task_id, "draft_pr_request")
+        if request["sha256"] != request_hash:
+            raise ValueError("发布审批对象已过期；请审批最新 Draft PR 请求")
+        approval = self.store.approve(task_id, "publish", request_hash, decision, actor, reason)
+        self.store.set_status(task_id, "ready_to_publish" if decision == "approved" else "publish_rejected")
+        self.memory.capture_approval(approval)
+
+    def publish_draft_pr(self, task_id: str, request_hash: str, publisher=None) -> dict[str, Any]:
+        """Commit, push and create a Draft PR after both approval gates."""
+        task = self.store.task(task_id)
+        if task["status"] != "ready_to_publish":
+            raise RuntimeError("任务尚未获得发布审批")
+        artifact = self.store.latest_artifact(task_id, "draft_pr_request")
+        if artifact["sha256"] != request_hash:
+            raise ValueError("Draft PR 请求哈希不匹配")
+        if not self.store.is_approved(task_id, "publish", request_hash):
+            raise RuntimeError("当前 Draft PR 请求没有有效发布审批")
+        request = json.loads(artifact["content"])
+        if request.get("draft") is not True:
+            raise ValueError("只允许创建 Draft PR")
+        current_diff = _git(
+            Path(task["workspace_path"]),
+            ["diff", "--no-ext-diff", "--binary", task["base_commit"]],
+        )
+        if _digest(current_diff) != request["diff_sha256"]:
+            self.store.set_status(task_id, "ready_to_execute")
+            self.store.event(task_id, "draft_pr_request_invalidated", {
+                "request_sha256": request_hash, "reason": "diff_changed",
+            })
+            raise ValueError("发布前 diff 已变化；请重新执行 diff 与发布审批")
+
+        publisher = publisher or GitHubDraftPRPublisher(GitHubAPI.from_env())
+        try:
+            result = publisher.publish(
+                workspace=task["workspace_path"], base_commit=task["base_commit"],
+                request=request, expected_diff_sha256=request["diff_sha256"],
+            )
+        except Exception as exc:
+            self.store.event(task_id, "draft_pr_publish_failed", {
+                "request_sha256": request_hash, "error_type": type(exc).__name__,
+            })
+            raise
+        if (
+            not isinstance(result, dict)
+            or result.get("draft") is not True
+            or str(result.get("repository", "")).lower() != request["repository"].lower()
+        ):
+            self.store.event(task_id, "draft_pr_publish_failed", {
+                "request_sha256": request_hash, "error_type": "InvalidPublisherResult",
+            })
+            raise RuntimeError("发布器没有返回匹配 repository 的 Draft PR")
+        result_hash = _digest(result)
+        self.store.artifact(
+            task_id, "draft_pr", json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True),
+            result_hash,
+        )
+        self.store.set_status(task_id, "draft_pr_created")
+        self.store.event(task_id, "draft_pr_created", {
+            "request_sha256": request_hash, "result_sha256": result_hash,
+            "repository": request["repository"], "number": result.get("number"),
+            "html_url": result.get("html_url"), "draft": True,
+        })
+        return result
+
+
+def re_fullmatch_remote(value: str) -> bool:
+    """Keep remote names out of option/argument ambiguity."""
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value))

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from core.audit import TaskStore
 from core.client import make_client
+from core.github import GitHubAPI, GitHubDraftPRPublisher
 from core.sandbox import DockerSandbox
 from core.workflow import IssueToPRWorkflow
 from issue_to_pr import IssueToPRService, PlanningUnavailable
@@ -64,6 +65,14 @@ class Handler(BaseHTTPRequestHandler):
                 context, plan, plan_hash = service().create_and_plan(body["repo_path"], body["issue"])
                 return self._reply(201, {"task_id": context.task_id, "workspace": str(context.workspace),
                                          "plan": plan, "plan_sha256": plan_hash})
+            if parts == ["tasks", "github"]:
+                context, plan, plan_hash, issue = service().create_from_github_issue(
+                    body["repo_path"], body["repository"], body["issue_number"], GitHubAPI.from_env(),
+                )
+                return self._reply(201, {
+                    "task_id": context.task_id, "workspace": str(context.workspace),
+                    "plan": plan, "plan_sha256": plan_hash, "github_issue": issue,
+                })
             if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "plan":
                 plan, plan_hash = service().plan_existing(parts[1])
                 return self._reply(200, {"task_id": parts[1], "plan": plan, "plan_sha256": plan_hash})
@@ -78,6 +87,25 @@ class Handler(BaseHTTPRequestHandler):
                 workflow.approve_diff(parts[1], body["subject_hash"], body.get("actor", "local-user"),
                                       body["decision"], body.get("reason"))
                 return self._reply(200, store.task(parts[1]))
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "draft-pr":
+                result = workflow.prepare_draft_pr(
+                    parts[1], repository=body["repository"], base_branch=body["base_branch"],
+                    head_branch=body["head_branch"], title=body["title"], body=body.get("body"),
+                    remote=body.get("remote", "origin"), commit_message=body.get("commit_message"),
+                )
+                return self._reply(200, result)
+            if len(parts) == 4 and parts[0] == "tasks" and parts[2:] == ["approvals", "publish"]:
+                workflow.approve_publish(
+                    parts[1], body["subject_hash"], body.get("actor", "local-user"),
+                    body["decision"], body.get("reason"),
+                )
+                return self._reply(200, store.task(parts[1]))
+            if len(parts) == 4 and parts[0] == "tasks" and parts[2:] == ["draft-pr", "publish"]:
+                result = workflow.publish_draft_pr(
+                    parts[1], body["subject_hash"],
+                    GitHubDraftPRPublisher(GitHubAPI.from_env()),
+                )
+                return self._reply(200, result)
             if len(parts) == 4 and parts[0] == "tasks" and parts[2:] == ["memories", "facts"]:
                 result = workflow.memory.remember_sourced_fact(
                     parts[1], body["statement"], body["source_path"], body["evidence"],

@@ -62,6 +62,10 @@ python -m benchmark.analyze_real_results --show-provenance
 > 无进展提醒听起来合理，但四次 smoke run 没有显示收益，其中一次还推迟了首次有效修改，
 > 因此没有默认启用。
 
+再打开 `benchmark/real/experiments/E2_REPORT.md`，展示 36 条同协议正式运行：B 组观察
+通过率最高且 token 最低，但自动终止真正触发的 3 条只有 1 条通过 hidden tests；加入
+Reviewer/Reviser 的 C 组没有超过 B。强调这是小样本机制验证，不是统计显著结论。
+
 ## 3:40～4:30：安全与人工审批
 
 展示 `core/policy.py` 和 `core/workflow.py`：
@@ -79,5 +83,5 @@ python -m benchmark.analyze_real_results --show-provenance
 - Multi-Agent 和 RAG 在已有实验中没有提高成功率；
 - 项目目前到 `PR-ready`，还没有默认执行外部 GitHub 写操作。
 
-最后给出下一步：基于补丁状态和测试结果的确定性终止、失败补丁的受控 Reviewer/Reviser，
-以及同协议多随机种子实验。
+最后给出下一步：保留确定性终止和 Reviewer/Reviser 的真实负面边界，完成受审批的
+GitHub Issue → 本地计划 → 修改/测试 → Draft PR 闭环；真正创建外部 PR 仍需人工确认。

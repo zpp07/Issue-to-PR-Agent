@@ -166,3 +166,22 @@ run used 478,796 tokens (estimated RMB 1.0112). This moves the bottleneck from
 phase transition to patch correctness/revision. Future rows now retain the
 structured repair plan and a capped unified Agent diff, and retryable provider
 disconnects receive one whole-job retry without becoming model failures.
+
+## E2 formal comparison (2026-09-22)
+
+The frozen v6 comparison uses four representative tasks, three independent
+provider-default repeats per task and three arms: model-driven finish, deterministic
+post-pytest finish, and a read-only Reviewer with at most one bounded Reviser. All
+36 rows share one clean code revision and one evaluator protocol.
+
+| Arm | Hidden pass | Wilson 95% CI | Total tokens |
+|---|---:|---:|---:|
+| A: model finish | 7/12 | 32.0%–80.7% | 4,214,901 |
+| B: deterministic finish | 9/12 | 46.8%–91.1% | 2,945,377 |
+| C: review/revise | 8/12 | 39.1%–86.2% | 4,084,183 |
+
+The controller fired only three times and those runs passed hidden tests just once,
+so visible pytest success remains an incomplete completion signal. Review/revise did
+not outperform B and cost 38.7% more tokens. These are diagnostic small-sample results,
+not a significance claim. Run `python -m benchmark.analyze_e2 --strict` to reproduce
+the tables without Docker or an API call; see `experiments/E2_REPORT.md` for details.

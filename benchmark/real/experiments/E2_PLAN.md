@@ -71,3 +71,18 @@ without issues remains incomplete. The v5 preflight then revealed that a provide
 may emit a tool call omitted from the current turn's schema. Protocol v6 rejects
 all unexposed tool calls and reserves the final two Reviewer turns for
 `review_finish`. Formal E2 rows use v6 only.
+
+## Completion record (2026-09-22)
+
+The formal v6 matrix is complete: 36/36 rows, all produced from clean revision
+`189bd42542196f616072c8692a9b57036524ddb9` with one frozen evaluator protocol.
+
+- Arm A: 7/12 hidden pass, 4,214,901 tokens, RMB 8.7336
+- Arm B: 9/12 hidden pass, 2,945,377 tokens, RMB 6.1339
+- Arm C: 8/12 hidden pass, 4,084,183 tokens, RMB 8.5394
+- Formal total: 11,244,461 tokens, RMB 23.4069
+
+One C run ended at 734,411 tokens because the pre-call budget check cannot stop an
+already issued response. No failed infrastructure attempt was written as a formal
+row. See `E2_REPORT.md` for confidence intervals, mechanism-level findings and the
+negative Reviewer/Reviser result.

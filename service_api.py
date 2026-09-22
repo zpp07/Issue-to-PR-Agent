@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 
 from core.audit import TaskStore
 from core.client import make_client
+from core.github import GitHubAPI, GitHubDraftPRPublisher, GitHubError
 from core.sandbox import DockerSandbox
 from core.workflow import IssueToPRWorkflow
 
@@ -34,6 +36,12 @@ class CreateTask(BaseModel):
     issue: str
 
 
+class CreateGitHubTask(BaseModel):
+    repo_path: str
+    repository: str
+    issue_number: int
+
+
 class ApprovalRequest(BaseModel):
     subject_hash: str
     decision: str
@@ -52,7 +60,21 @@ class SourcedFactRequest(BaseModel):
     evidence: str
 
 
-app = FastAPI(title="Local Issue-to-PR Agent", version="0.5.0")
+class DraftPRRequest(BaseModel):
+    repository: str
+    base_branch: str
+    head_branch: str
+    title: str
+    body: str | None = None
+    remote: str = "origin"
+    commit_message: str | None = None
+
+
+class PublishRequest(BaseModel):
+    subject_hash: str
+
+
+app = FastAPI(title="Local Issue-to-PR Agent", version="0.6.0")
 
 
 def service() -> IssueToPRService:
@@ -62,11 +84,29 @@ def service() -> IssueToPRService:
     )
 
 
+def github() -> GitHubAPI:
+    return GitHubAPI.from_env()
+
+
 @app.post("/tasks")
 def create_task(request: CreateTask):
     try:
         context, plan, plan_hash = service().create_and_plan(request.repo_path, request.issue)
         return {"task_id": context.task_id, "workspace": str(context.workspace), "plan": plan, "plan_sha256": plan_hash}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/tasks/github")
+def create_github_task(request: CreateGitHubTask):
+    try:
+        context, plan, plan_hash, issue = service().create_from_github_issue(
+            request.repo_path, request.repository, request.issue_number, github(),
+        )
+        return {
+            "task_id": context.task_id, "workspace": str(context.workspace),
+            "plan": plan, "plan_sha256": plan_hash, "github_issue": issue,
+        }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -104,6 +144,37 @@ def approve_diff(task_id: str, request: ApprovalRequest):
     try:
         workflow.approve_diff(task_id, request.subject_hash, request.actor, request.decision, request.reason)
         return workflow.store.task(task_id)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/tasks/{task_id}/draft-pr")
+def prepare_draft_pr(task_id: str, request: DraftPRRequest):
+    try:
+        return workflow.prepare_draft_pr(task_id, **request.model_dump())
+    except (KeyError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/tasks/{task_id}/approvals/publish")
+def approve_publish(task_id: str, request: ApprovalRequest):
+    try:
+        workflow.approve_publish(
+            task_id, request.subject_hash, request.actor, request.decision, request.reason,
+        )
+        return workflow.store.task(task_id)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/tasks/{task_id}/draft-pr/publish")
+def publish_draft_pr(task_id: str, request: PublishRequest):
+    try:
+        return workflow.publish_draft_pr(
+            task_id, request.subject_hash, GitHubDraftPRPublisher(github()),
+        )
+    except (GitHubError, subprocess.CalledProcessError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except (KeyError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

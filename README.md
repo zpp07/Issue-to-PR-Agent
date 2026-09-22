@@ -29,11 +29,12 @@ flowchart LR
 | 可靠执行 | 超时、重试、token/成本/步数预算 | `core/client.py`、`core/agent.py` |
 | 安全边界 | 无网络、非 root、只读容器根、写入 allowlist | `core/sandbox.py`、`core/policy.py` |
 | 人工监督 | 计划与 diff 审批绑定精确 SHA-256 | `core/workflow.py` |
+| GitHub 闭环 | Issue 导入 + 独立发布审批 + Draft PR | `core/github.py`、`docs/GITHUB_DRAFT_PR.md` |
 | 仓库理解 | BM25 + 向量召回 + 重排 + symbol 级读取 | `core/search.py`、`core/symbols.py` |
 | 可审计记忆 | 只保存带来源和文件哈希的事实 | `core/memory.py` |
 | 实证评测 | toy/harder/真实仓库三层 benchmark | `benchmark/` |
 
-截至 2026-09-21，确定性测试基线为 **63 passed**。真实仓库历史账本包含 11 次混合协议
+截至 2026-09-22，确定性测试基线为 **70 passed**。真实仓库历史账本包含 11 次混合协议
 运行；项目明确保留 Multi-Agent、RAG 和无进展干预未带来稳定收益的负面结果，不把小样本
 包装成能力提升。
 
@@ -194,7 +195,7 @@ python -m benchmark.analyze_real_results --show-provenance
 1/2。结论是**不默认启用 W5**，并保留这个负结果。详见
 [`benchmark/real/experiments/E1_NO_PROGRESS_REPORT.md`](benchmark/real/experiments/E1_NO_PROGRESS_REPORT.md)。
 
-### 当前控制回路（待真实实验验证）
+### E2：确定性终止与补丁后 Reviewer/Reviser
 
 - 控制器跟踪补丁版本、成功修改、pytest 退出码和剩余预算；只有“最新补丁在修改后通过
   pytest”才会确定性结束，不再依赖模型额外调用 `finish`。
@@ -204,7 +205,19 @@ python -m benchmark.analyze_real_results --show-provenance
 - hidden tests 和 gold patch 始终不进入 Reviewer/Reviser 上下文，只由最终 evaluator 使用，
   避免通过评测反馈迭代补丁造成 benchmark 泄漏。
 
-以上机制已经过离线单元测试，但在 E2 同协议重复实验完成前，不宣称能够提升真实任务成功率。
+2026-09-22 完成同一 v6 协议下 4 个任务 × 3 组 × 3 次重复，共 36 条正式运行：
+
+| 组 | 机制 | Hidden pass | Wilson 95% CI | 总 tokens |
+|---|---|---:|---:|---:|
+| A | single / 模型自行 finish | 7/12 (58.3%) | 32.0%–80.7% | 4,214,901 |
+| B | single / 控制器确定性终止 | 9/12 (75.0%) | 46.8%–91.1% | 2,945,377 |
+| C | Reviewer + 最多一次 Reviser | 8/12 (66.7%) | 39.1%–86.2% | 4,084,183 |
+
+B 的观察结果最好且 token 比 A 少 30.1%，但控制器实际只触发 3 次，并且这些运行的 hidden
+pass 只有 1/3：可见 pytest 通过仍可能是假收敛。C 比 B 多用 38.7% token 且没有提高观察
+通过率，因此 Reviewer/Reviser 保持可选而不默认开启。样本很小、没有显式随机种子，不能作
+显著性或因果结论。完整账本、协议和可复现统计见
+[`benchmark/real/experiments/E2_REPORT.md`](benchmark/real/experiments/E2_REPORT.md)。
 
 ## Phase 5：有来源的任务记忆
 
@@ -217,6 +230,18 @@ python -m benchmark.analyze_real_results --show-provenance
 - REST 接口可以查询记忆或提交带逐字证据的文件事实，没有“保存任意模型总结”的接口。
 
 这不是聊天记录归档，而是一个小型、可审计的 provenance memory。
+
+## Phase 6：受审批的 GitHub Draft PR
+
+`core/github.py` 和本地 REST API 已接通 GitHub Issue 导入与 Draft PR 发布。系统不会把
+diff 审批偷换成外部写权限：它会先冻结 repository、分支、标题、正文、commit message
+和已审批 diff/test 哈希，再要求一次独立 `publish` 审批。只有两个审批都有效时才允许
+commit、push 和调用 GitHub API，并强制 `draft=true`。
+
+发布前若 diff 改变或出现未跟踪文件，操作会被拒绝；没有 `GITHUB_TOKEN` 时会在任何 Git
+写操作之前失败。相同分支重试会查找并复用已有 Draft PR。详细状态机、端点和最小权限见
+[`docs/GITHUB_DRAFT_PR.md`](docs/GITHUB_DRAFT_PR.md)。代码路径已有离线 fake-publisher
+回归测试，但尚未替用户创建真实 PR；真实外部发布仍需单独明确确认。
 
 ## 文件结构
 
@@ -364,5 +389,6 @@ python experiment.py --cases case01_add --methods mreview,self
 - [x] 增加有来源、可失效的任务记忆
 - [x] 基于补丁版本和 pytest 结果的确定性终止控制
 - [x] 候选补丁之后的一次 Reviewer + Reviser 闭环（不接触 hidden tests）
-- [ ] 完成 E2 同协议重复实验并报告置信区间与负面结果
-- [ ] 受审批的 commit / PR body / GitHub Draft PR 创建与技术报告
+- [x] 完成 E2 同协议重复实验并报告置信区间与负面结果
+- [x] 受审批的 commit / PR body / GitHub Draft PR 创建与技术报告（离线验证）
+- [ ] 经作者单独确认后完成一次真实 GitHub Draft PR smoke

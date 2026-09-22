@@ -1,0 +1,569 @@
+{
+  "protocol_version": "review_revise-v6-verified-auto-np-off",
+  "protocol_hash": "75bac88eaee1423126ead0b042df9ebbd74a81a509eb77443702996f71629d68",
+  "protocol": {
+    "schema_version": 1,
+    "strategy": "review_revise",
+    "model": {
+      "provider": "openai-compatible",
+      "name": "deepseek-chat",
+      "sampling": {
+        "temperature": "provider_default",
+        "top_p": "provider_default",
+        "seed": null,
+        "tool_choice": "provider_default"
+      }
+    },
+    "prompts": {
+      "coder": {
+        "sha256": "932b3df9c2181a35a5a7a6d817d1ea4a721155f659a21901ff808cd5aba99786",
+        "chars": 964
+      },
+      "reviewer": {
+        "sha256": "740d7269433ec4958a6d23ca92404e2eba1abea3516d96c8ff23cf141172e6b6",
+        "chars": 534
+      },
+      "reviewer_final_step": {
+        "sha256": "18fadea536a1a119fd5deb0edb51dbbbbe29e3be6a2fe832786e1ef4d96d2c1f",
+        "chars": 82
+      },
+      "reviser": {
+        "sha256": "c7d01614bc8fa23f526e6e4ffeab8e6d79907de186964ab27842992a653d5fd0",
+        "chars": 387
+      },
+      "reviser_final_step": {
+        "sha256": "20831b11ad9f8ed1e90a3d4043e066f374d0ae66e46b376e81b0adead9fd447f",
+        "chars": 128
+      }
+    },
+    "tool_schemas": {
+      "coder": [
+        {
+          "type": "function",
+          "function": {
+            "name": "search_code",
+            "description": "在代码库中进行 AST/文档结构切块后的混合检索，返回带文件与行号的证据",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string",
+                  "description": "错误行为、符号、契约或相关关键词"
+                },
+                "top_k": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10,
+                  "default": 5
+                }
+              },
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "description": "读取文件；大文件或定位到行号后应使用 start_line/end_line 分段读取",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "文件路径"
+                },
+                "start_line": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "end_line": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "read_symbol",
+            "description": "按 qualified Python symbol 精确读取定义及有界上下文；歧义时返回候选，不要猜测 occurrence",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Python 文件路径"
+                },
+                "symbol": {
+                  "type": "string",
+                  "description": "如 GroupDefault.get_override_key"
+                },
+                "occurrence": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "context_lines": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 50,
+                  "default": 3
+                }
+              },
+              "required": [
+                "path",
+                "symbol"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "replace_text",
+            "description": "在现有文件中把唯一匹配的 old 精确替换为 new，适合局部代码修改",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "文件路径"
+                },
+                "old": {
+                  "type": "string",
+                  "description": "必须且只能匹配一次的原文本"
+                },
+                "new": {
+                  "type": "string",
+                  "description": "替换后的文本"
+                }
+              },
+              "required": [
+                "path",
+                "old",
+                "new"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "write_file",
+            "description": "覆盖写入指定文件",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "文件路径"
+                },
+                "content": {
+                  "type": "string",
+                  "description": "要写入的完整内容"
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "run_command",
+            "description": "运行已批准的 argv 命令并返回输出；不能使用 shell、管道或重定向",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "argv": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "命令和参数，例如 [\"python\", \"-m\", \"pytest\", \"-q\"]"
+                }
+              },
+              "required": [
+                "argv"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "finish",
+            "description": "任务完成，调用此工具给出结构化最终结果",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "string",
+                  "description": "最终结果或总结"
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          }
+        }
+      ],
+      "reviewer": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "description": "读取文件；大文件或定位到行号后应使用 start_line/end_line 分段读取",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "文件路径"
+                },
+                "start_line": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "end_line": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "read_symbol",
+            "description": "按 qualified Python symbol 精确读取定义及有界上下文；歧义时返回候选，不要猜测 occurrence",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Python 文件路径"
+                },
+                "symbol": {
+                  "type": "string",
+                  "description": "如 GroupDefault.get_override_key"
+                },
+                "occurrence": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "context_lines": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 50,
+                  "default": 3
+                }
+              },
+              "required": [
+                "path",
+                "symbol"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "review_finish",
+            "description": "审查完成，用结构化格式给出结论",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "passed": {
+                  "type": "boolean",
+                  "description": "代码是否通过审查"
+                },
+                "issues": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "发现的问题列表；通过则为空数组"
+                }
+              },
+              "required": [
+                "passed",
+                "issues"
+              ]
+            }
+          }
+        }
+      ],
+      "reviser": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "description": "读取文件；大文件或定位到行号后应使用 start_line/end_line 分段读取",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "文件路径"
+                },
+                "start_line": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "end_line": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "read_symbol",
+            "description": "按 qualified Python symbol 精确读取定义及有界上下文；歧义时返回候选，不要猜测 occurrence",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Python 文件路径"
+                },
+                "symbol": {
+                  "type": "string",
+                  "description": "如 GroupDefault.get_override_key"
+                },
+                "occurrence": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "context_lines": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 50,
+                  "default": 3
+                }
+              },
+              "required": [
+                "path",
+                "symbol"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "replace_text",
+            "description": "在现有文件中把唯一匹配的 old 精确替换为 new，适合局部代码修改",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "文件路径"
+                },
+                "old": {
+                  "type": "string",
+                  "description": "必须且只能匹配一次的原文本"
+                },
+                "new": {
+                  "type": "string",
+                  "description": "替换后的文本"
+                }
+              },
+              "required": [
+                "path",
+                "old",
+                "new"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "write_file",
+            "description": "覆盖写入指定文件",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "文件路径"
+                },
+                "content": {
+                  "type": "string",
+                  "description": "要写入的完整内容"
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "run_command",
+            "description": "运行已批准的 argv 命令并返回输出；不能使用 shell、管道或重定向",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "argv": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "命令和参数，例如 [\"python\", \"-m\", \"pytest\", \"-q\"]"
+                }
+              },
+              "required": [
+                "argv"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "finish",
+            "description": "任务完成，调用此工具给出结构化最终结果",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "string",
+                  "description": "最终结果或总结"
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "budgets": {
+      "max_steps": 25,
+      "planner_steps": 10,
+      "max_tokens": 700000,
+      "max_cost_rmb": 2.0,
+      "search_calls": 8
+    },
+    "retrieval": {
+      "chunk_max_lines": 120,
+      "initial_evidence_file_limit": 3,
+      "default_top_k": 5,
+      "candidate_k": 20,
+      "hybrid_weights": {
+        "bm25": 0.65,
+        "dense": 0.35
+      },
+      "final_weights": {
+        "hybrid": 0.45,
+        "reranker": 0.55
+      },
+      "dense_backend": "hashing",
+      "reranker_backend": "lexical"
+    },
+    "tool_behavior": {
+      "max_tool_output_chars": 12000,
+      "max_read_lines": 200,
+      "write_scope": "existing-production-python-allowlist",
+      "command_policy": "pytest-and-ruff-no-shell"
+    },
+    "no_progress": {
+      "enabled": false,
+      "after_llm_turns": null,
+      "max_triggers": 1,
+      "applies_to": "single-before-first-successful-mutation",
+      "decision_tool_visibility": "only-after-trigger",
+      "next_action_enforcement": {
+        "minimal_edit": [
+          "replace_text",
+          "write_file"
+        ],
+        "targeted_read": [
+          "read_file",
+          "read_symbol"
+        ]
+      }
+    },
+    "completion_policy": {
+      "auto_finish_after_verified_patch": true,
+      "requires_successful_mutation": true,
+      "accepted_verification": "pytest-exit-zero-after-latest-mutation",
+      "hidden_tests_used_for_control": false,
+      "terminal_tool_enforcement": {
+        "planner": [
+          "plan_finish"
+        ],
+        "reviewer": {
+          "tools": [
+            "review_finish"
+          ],
+          "reserved_turns": 2
+        },
+        "reviser": [
+          "finish"
+        ]
+      },
+      "reject_calls_to_unexposed_tools": true,
+      "review_output_normalization": "missing-issues-is-empty-only-when-passed-true"
+    },
+    "stage_budgets": {
+      "coder_or_executor_steps": 25,
+      "planner_steps": 0,
+      "reviewer_steps": 6,
+      "reviser_steps": 10,
+      "max_revision_passes": 1
+    }
+  },
+  "evaluation_protocol_hash": "19b8930fb4e55d2f188bde0e1a3d137a19a4b66d9e8d32e5511e9fb99b55a513",
+  "evaluation_protocol": {
+    "schema_version": 1,
+    "manifest_sha256": "55acda4c42fbd9e23e2110eeb15e3694f7c0de802dc5adc3582c7bf11df113e7",
+    "cases_sha256": "09ae1efe4a2a414d3b849f9521851f66b12b4c948b41c19f643f9c8ae19b9e26",
+    "docker_image_refs": [
+      "issue-to-pr-dask:phase45",
+      "issue-to-pr-dvc:phase45",
+      "issue-to-pr-dvc:phase45",
+      "issue-to-pr-hydra:phase45",
+      "issue-to-pr-hydra:phase45",
+      "issue-to-pr-pydantic:phase45"
+    ],
+    "hidden_tests_visible_to_agent": false,
+    "pass_to_pass_sample": 5,
+    "regression_check": "rerun-pass-to-pass-separately-after-combined-failure",
+    "container": {
+      "cpus": 2.0,
+      "memory": "2g",
+      "pids": 256,
+      "timeout": 300
+    }
+  }
+}
