@@ -25,7 +25,8 @@ def test_command_policy_and_shell_free_execution():
     assert run_command([sys.executable, "--version"]).startswith("Python")
 
 
-def test_dependency_free_client_fallback_can_be_constructed():
+def test_dependency_free_client_fallback_can_be_constructed(monkeypatch):
+    monkeypatch.setattr("core.client.OpenAI", None)
     client = make_client(api_key="test-key", base_url="http://127.0.0.1:9")
     assert isinstance(client, StdlibOpenAI)
     assert client.chat.completions is not None
