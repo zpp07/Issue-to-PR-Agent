@@ -39,7 +39,9 @@ flowchart LR
 **36 条**。这些记录不能混算成功率；项目保留 Multi-Agent、RAG 和无进展干预未带来稳定
 收益的负面结果，不把小样本包装成能力提升。
 
-## 快速开始（无需 API key）
+## 快速开始（离线测试无需 API key）
+
+先准备 Python **>=3.10** 和 Git。以下命令可验证离线逻辑；不需要 Docker 或模型密钥。
 
 ```powershell
 python -m venv .venv
@@ -51,6 +53,26 @@ python -m pytest
 
 上述命令只验证本地控制逻辑，不会调用付费模型。完整的 3～5 分钟演示路线、讲解词和预期
 输出见 [`docs/DEMO.md`](docs/DEMO.md)。
+
+## 打开本地界面
+
+安装依赖后，在项目根目录运行一条命令，服务会监听本机并尝试打开浏览器：
+
+```powershell
+python service_http.py --open
+```
+
+浏览器没有自动打开时，手动访问 `http://127.0.0.1:8765/`。启动时会打印 Python、项目
+依赖、Git、Docker、runner 镜像和模型配置的自检结果；缺少执行前提时页面仍可打开，但对应
+功能会失败。**真实建任务和执行不是“clone 后零配置”**：需要 Python >=3.10、
+`pip install -e ".[dev]"`、Git、已启动的 Docker Desktop、`issue-to-pr-runner:phase3`
+镜像，以及本地模型配置。构建镜像和配置模型的方法见下一节；自检只判断密钥环境变量是否
+存在或项目 `.env` 文件是否存在，不读取或显示密钥，也不验证密钥有效性。
+
+界面默认只到 `ready_to_publish`，没有真实 GitHub 发布按钮。可用
+`python service_http.py --open --fake-publisher` 显式启用**模拟发布**；这不会创建 PR。
+本地服务仅监听 `127.0.0.1`，没有用户认证，不应暴露到公网。详细界面契约见
+[`docs/WEB_UI_W4.md`](docs/WEB_UI_W4.md)。
 
 ## 运行一次隔离修复
 
@@ -81,9 +103,9 @@ Issue → 结构化计划 → 计划审批 → 独立 Git worktree → 修复/�
 - `issue_to_pr.py`：把 Planner 和 Coder/Reviewer 接入状态机。
 - `service_api.py`：可选 FastAPI 接口；安装 `pip install -e '.[web]'` 后运行
   `uvicorn service_api:app --reload`。
-- 若开发机尚未安装第三方依赖，可直接运行 `python service_http.py`；它只用
-  Python 标准库提供同一组本地 REST 端点，`core/client.py` 也会在缺少 OpenAI SDK 时
-  降级为 OpenAI-compatible HTTP 调用。
+- `python service_http.py --open` 的 HTTP 层只用 Python 标准库；项目依赖仍建议
+  按快速开始安装。缺少 OpenAI SDK 时 `core/client.py` 有后备 HTTP 调用，
+  但不应把它理解为完整依赖已就绪。
 
 注意：pytest/Python 仍会执行任务仓库代码，因此本阶段的 host 策略不是隔离边界；
 Docker 无网络运行环境属于下一阶段。

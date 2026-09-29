@@ -1,17 +1,24 @@
 """Dependency-free HTTP façade for the local Issue-to-PR workflow.
 
-Run: python service_http.py
+Run: python service_http.py --open
 It is intentionally local-only (127.0.0.1) and has no authentication because
 the project scope is a single-user local prototype.
 """
 from __future__ import annotations
 
 import argparse
+import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import sys
+import threading
 from urllib.parse import parse_qs, urlsplit
+import webbrowser
+
+if sys.version_info < (3, 10):
+    raise SystemExit("Issue-to-PR UI 需要 Python >=3.10；请换用受支持的解释器后启动")
 
 from core.audit import TaskStore
 from core.client import make_client
@@ -20,6 +27,7 @@ from core.fake_publisher import FakeDraftPRPublisher
 from core.github import GitHubAPI, GitHubDraftPRPublisher
 from core.read_views import artifact_content, artifact_list, task_page
 from core.sandbox import DockerSandbox
+from core.startup import print_startup_checks, startup_checks
 from core.workflow import IssueToPRWorkflow
 from issue_to_pr import IssueToPRService, PlanningUnavailable
 
@@ -185,13 +193,51 @@ class Handler(BaseHTTPRequestHandler):
         return  # audit data is in SQLite; do not add noisy stdout request logs.
 
 
-if __name__ == "__main__":
+def _open_browser(url: str) -> None:
+    try:
+        if webbrowser.open(url, new=2):
+            return
+    except Exception:
+        pass
+    print(f"未能自动打开浏览器；请手动访问 {url}", flush=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    global FAKE_PUBLISHER_MODE
     parser = argparse.ArgumentParser(description="Local Issue-to-PR API and UI")
+    parser.add_argument("--open", action="store_true", help="Start the service and open the local UI in a browser")
     parser.add_argument("--fake-publisher", action="store_true",
                         help="Enable a no-network simulated Draft PR publication button")
-    FAKE_PUBLISHER_MODE = parser.parse_args().fake_publisher
-    execution_manager.recover_interrupted()
-    print("Issue-to-PR local UI: http://127.0.0.1:8765")
-    if FAKE_PUBLISHER_MODE:
-        print("Fake publisher enabled: simulation only; real publish API disabled")
-    ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
+    args = parser.parse_args(argv)
+    FAKE_PUBLISHER_MODE = args.fake_publisher
+    print_startup_checks(startup_checks(ROOT))
+    url = "http://127.0.0.1:8765/"
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, 10048) or getattr(exc, "winerror", None) == 10048:
+            print("无法启动：127.0.0.1:8765 已被占用。请关闭旧服务或占用该端口的程序后重试。",
+                  file=sys.stderr, flush=True)
+        else:
+            print(f"无法监听 127.0.0.1:8765：{exc}", file=sys.stderr, flush=True)
+        return 2
+    try:
+        execution_manager.recover_interrupted()
+        print(f"Issue-to-PR local UI: {url}", flush=True)
+        if FAKE_PUBLISHER_MODE:
+            print("Fake publisher enabled: simulation only; real publish API disabled", flush=True)
+        if args.open:
+            try:
+                threading.Thread(target=_open_browser, args=(url,), daemon=True).start()
+            except RuntimeError:
+                print(f"无法启动浏览器打开任务；请手动访问 {url}", flush=True)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("本地服务已停止", flush=True)
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
