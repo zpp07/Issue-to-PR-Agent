@@ -85,11 +85,16 @@ class IssueToPRWorkflow:
         return subject_hash
 
     def approve_plan(self, task_id: str, plan_hash: str, actor: str, decision: str, reason: str | None = None) -> None:
+        current_status = self.store.task(task_id)["status"]
+        if current_status not in {"awaiting_plan_approval", "plan_rejected"}:
+            raise RuntimeError("任务不在计划审批状态")
         plan = self.store.latest_artifact(task_id, "plan")
         if plan["sha256"] != plan_hash:
             raise ValueError("计划哈希不匹配；请审批当前版本")
         approval = self.store.approve(task_id, "plan", plan_hash, decision, actor, reason)
-        self.store.set_status(task_id, "ready_to_execute" if decision == "approved" else "plan_rejected")
+        next_status = "ready_to_execute" if decision == "approved" else "plan_rejected"
+        if not self.store.transition_status(task_id, current_status, next_status):
+            raise RuntimeError("计划审批期间任务状态已变化")
         self.memory.capture_approval(approval)
         if decision == "approved":
             self.memory.capture_approved_plan(task_id)
@@ -97,7 +102,7 @@ class IssueToPRWorkflow:
     def executor_for(self, task_id: str, workdir: str | Path | None = None,
                      command_runner=None, code_search=None, writable_files=None):
         task = self.store.task(task_id)
-        if task["status"] != "ready_to_execute":
+        if task["status"] not in {"ready_to_execute", "executing"}:
             raise RuntimeError("任务尚未获得计划审批")
         plan = self.store.latest_artifact(task_id, "plan")
         if not self.store.is_approved(task_id, "plan", plan["sha256"]):
@@ -128,7 +133,7 @@ class IssueToPRWorkflow:
 
     def record_execution(self, task_id: str, test_report: str, reviewer_report: dict[str, Any]) -> dict[str, str]:
         task = self.store.task(task_id)
-        if task["status"] != "ready_to_execute":
+        if task["status"] not in {"ready_to_execute", "executing"}:
             raise RuntimeError("任务不在可执行状态")
         workspace = Path(task["workspace_path"])
         diff = _git(workspace, ["diff", "--no-ext-diff", "--binary", task["base_commit"]])
@@ -170,6 +175,8 @@ class IssueToPRWorkflow:
         self.store.event(task_id, "validation_reconciled", {"reason": reason})
 
     def approve_diff(self, task_id: str, review_hash: str, actor: str, decision: str, reason: str | None = None) -> None:
+        if self.store.task(task_id)["status"] != "awaiting_diff_approval":
+            raise RuntimeError("任务不在 diff 审批状态")
         review = self.store.latest_artifact(task_id, "diff_review")
         if review["sha256"] != review_hash:
             raise ValueError("diff 审批对象已过期；请审批最新 diff/test 组合")

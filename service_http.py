@@ -10,9 +10,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from core.audit import TaskStore
 from core.client import make_client
+from core.execution import ExecutionManager
 from core.github import GitHubAPI, GitHubDraftPRPublisher
 from core.sandbox import DockerSandbox
 from core.workflow import IssueToPRWorkflow
@@ -33,6 +35,9 @@ def service():
     )
 
 
+execution_manager = ExecutionManager(store, service)
+
+
 class Handler(BaseHTTPRequestHandler):
     def _body(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -48,7 +53,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            parts = self.path.strip("/").split("/")
+            parsed = urlsplit(self.path)
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "events":
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                after = int(query.get("after", ["0"])[0])
+                limit = int(query.get("limit", ["100"])[0])
+                return self._reply(200, execution_manager.event_page(parts[1], after, limit))
             if len(parts) == 2 and parts[0] == "tasks":
                 task_id = parts[1]
                 return self._reply(200, {"task": store.task(task_id), "events": store.events(task_id)})
@@ -57,6 +68,8 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, {"detail": "not found"})
         except KeyError as exc:
             self._reply(404, {"detail": str(exc)})
+        except ValueError as exc:
+            self._reply(400, {"detail": str(exc)})
 
     def do_POST(self):
         try:
@@ -81,8 +94,8 @@ class Handler(BaseHTTPRequestHandler):
                                       body["decision"], body.get("reason"))
                 return self._reply(200, store.task(parts[1]))
             if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "execute":
-                result = service().execute_after_plan_approval(parts[1], body["target_file"], body.get("max_rounds", 3))
-                return self._reply(200, result)
+                result = execution_manager.submit(parts[1], body["target_file"], body.get("max_rounds", 3))
+                return self._reply(202, result)
             if len(parts) == 4 and parts[0] == "tasks" and parts[2:] == ["approvals", "diff"]:
                 workflow.approve_diff(parts[1], body["subject_hash"], body.get("actor", "local-user"),
                                       body["decision"], body.get("reason"))
@@ -124,5 +137,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    execution_manager.recover_interrupted()
     print("Issue-to-PR local API: http://127.0.0.1:8765")
     ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()

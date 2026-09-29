@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import subprocess
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from coder_reviewer import multi_agent_review
 from core.agent import run_agent
 from core.audit import TaskStore
 from core.client import LLMCallError
+from core.execution import ExecutionManager
 from core.tools import ToolResult, build_tool_registry
 from core.workflow import IssueToPRWorkflow
 from issue_to_pr import IssueToPRService
@@ -236,14 +238,22 @@ def test_service_persists_only_public_fields_during_fake_execution(tmpdir, monke
     monkeypatch.setattr(service_http, "store", store)
     monkeypatch.setattr(service_http, "workflow", workflow)
     monkeypatch.setattr(service_http, "service", lambda: service)
+    monkeypatch.setattr(service_http, "execution_manager", ExecutionManager(store, lambda: service))
     post = SimpleNamespace(
         path=f"/tasks/{context.task_id}/execute",
         _body=lambda: {"target_file": "buggy.py", "max_rounds": 1},
         _reply=lambda status, payload: (status, payload),
     )
     status, result = service_http.Handler.do_POST(post)
-    assert status == 200
-    assert "review_sha256" in result
+    assert status == 202
+    assert result["status"] == "executing"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        page = service_http.execution_manager.event_page(context.task_id)
+        if page["execution_done"]:
+            break
+        time.sleep(0.02)
+    assert page["execution_done"] is True
     assert store.task(context.task_id)["status"] == "awaiting_diff_approval"
     get = SimpleNamespace(
         path=f"/tasks/{context.task_id}",

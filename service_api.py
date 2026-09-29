@@ -11,6 +11,7 @@ import subprocess
 
 from core.audit import TaskStore
 from core.client import make_client
+from core.execution import ExecutionManager
 from core.github import GitHubAPI, GitHubDraftPRPublisher, GitHubError
 from core.sandbox import DockerSandbox
 from core.workflow import IssueToPRWorkflow
@@ -84,6 +85,14 @@ def service() -> IssueToPRService:
     )
 
 
+execution_manager = ExecutionManager(store, service)
+
+
+@app.on_event("startup")
+def recover_interrupted_executions():
+    execution_manager.recover_interrupted()
+
+
 def github() -> GitHubAPI:
     return GitHubAPI.from_env()
 
@@ -131,10 +140,10 @@ def approve_plan(task_id: str, request: ApprovalRequest):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.post("/tasks/{task_id}/execute")
+@app.post("/tasks/{task_id}/execute", status_code=202)
 def execute(task_id: str, request: ExecuteRequest):
     try:
-        return service().execute_after_plan_approval(task_id, request.target_file, request.max_rounds)
+        return execution_manager.submit(task_id, request.target_file, request.max_rounds)
     except (KeyError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -185,6 +194,16 @@ def get_task(task_id: str):
         return {"task": workflow.store.task(task_id), "events": workflow.store.events(task_id)}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/tasks/{task_id}/events")
+def get_events(task_id: str, after: int = 0, limit: int = 100):
+    try:
+        return execution_manager.event_page(task_id, after, limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/tasks/{task_id}/memories")
