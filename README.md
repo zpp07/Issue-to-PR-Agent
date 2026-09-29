@@ -9,6 +9,12 @@
 > 当前定位：求职作品级研究原型，不是无人监管的生产机器人。系统默认不会推送代码或创建
 > GitHub PR；外部写操作必须经过明确审批。
 
+**本地界面已可用**：浏览器中可查看任务列表、提交 Issue、审批计划、跟踪逐步执行事件、
+审阅完整 diff，并冻结 Draft PR 请求及审批发布。默认流程停在 `ready_to_publish`，
+界面没有真实 GitHub 发布入口；显式模拟模式会标注“模拟发布”。
+启动方法见[打开本地界面](#打开本地界面)。**界面截图待人工补充**；这里不使用示意图冒充
+真实运行截图。
+
 ## 30 秒看懂项目
 
 ```mermaid
@@ -34,10 +40,11 @@ flowchart LR
 | 可审计记忆 | 只保存带来源和文件哈希的事实 | `core/memory.py` |
 | 实证评测 | toy/harder/真实仓库三层 benchmark | `benchmark/` |
 
-截至 2026-09-23，确定性测试基线为 **72 passed**。真实仓库评测累计保留 **54 条运行记录**：
+截至 2026-09-23，真实仓库评测累计保留 **54 条运行记录**：
 历史混合协议账本 11 条、E1 4 条、E2 pilot 3 条，以及同一 v6 冻结协议的 E2 正式运行
 **36 条**。这些记录不能混算成功率；项目保留 Multi-Agent、RAG 和无进展干预未带来稳定
-收益的负面结果，不把小样本包装成能力提升。
+收益的负面结果，不把小样本包装成能力提升。产品化回归测试持续增加；
+报告测试数量时必须注明解释器和可选依赖环境，不能把 skipped 计作 passed。
 
 ## 快速开始（离线测试无需 API key）
 
@@ -268,6 +275,15 @@ commit、push 和调用 GitHub API，并强制 `draft=true`。
 [`docs/GITHUB_DRAFT_PR.md`](docs/GITHUB_DRAFT_PR.md)。代码路径已有离线 fake-publisher
 回归测试，但尚未替用户创建真实 PR；真实外部发布仍需单独明确确认。
 
+## 产品化契约与演示文档
+
+- [W2 执行事件与轮询契约](docs/EXECUTION_EVENTS_W2.md)
+- [W3 只读任务与 artifact API](docs/READ_ONLY_API_W3.md)
+- [W4 本地界面与模拟发布契约](docs/WEB_UI_W4.md)
+- [W5 启动自检与一键打开契约](docs/STARTUP_W5.md)
+- [W5/W6 验收环境与离线全链路证据](docs/PRODUCTIZATION_W6_VERIFICATION.md)
+- [基于界面的演示脚本](docs/DEMO.md)
+
 ## 文件结构
 
 ```
@@ -275,8 +291,9 @@ multi-agent/
 ├── core/                   # Agent、检索、来源记忆、审批、审计与 Docker sandbox
 ├── benchmark/              # Phase 3 基线 + Phase 4 harder-suite 消融
 ├── docker/                 # 隔离执行镜像
-├── docs/                   # 路线图与 Phase 1–5 交接文档
-├── tests/                  # Phase 2–5 主回归测试
+├── docs/                   # 路线图、交接与 W2–W5 产品化契约
+├── web/                    # 无构建步骤的同源 HTML/CSS/JS 界面
+├── tests/                  # 离线回归与产品化端到端测试
 ├── pyproject.toml          # 可安装项目与依赖声明
 ├── service_http.py         # 标准库本地 REST 服务
 ├── service_api.py          # 可选 FastAPI 服务

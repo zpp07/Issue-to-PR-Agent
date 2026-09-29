@@ -1,87 +1,61 @@
-# 3～5 分钟项目演示脚本
+# 3～5 分钟界面演示脚本
 
-这份脚本用于录屏、面试现场或项目介绍。目标不是展示大量终端输出，而是在五分钟内证明：
-系统能安全修改代码、独立判断结果，并诚实记录失败和成本。
+这是一份**浏览器走读**，不是终端命令清单。目标是让观众看见任务状态、逐步事件、
+完整 diff 和两次独立审批之间的关系；不要声称界面本身验证了隐藏测试或创建了真实 PR。
 
-## 演示前准备
+## 演示前准备与真实性边界
 
-```powershell
-python -m pip install -e ".[dev]"
-python -m pytest -q
-docker build -t issue-to-pr-runner:phase3 -f docker\Dockerfile .
-```
+在本机按 [W5 启动契约](STARTUP_W5.md)准备依赖并运行
+`python service_http.py --open`，确认页面是 `http://127.0.0.1:8765/`。
+录屏前找一条**已经由真实工作流产生、允许展示内容**的本地任务，确认它确实有
+计划、执行事件、diff、测试报告和 Draft PR 请求。不要用手填 JSON 或拼接截图
+伪装运行结果，也不要在录屏中打开 `.env` 或显示密钥。
 
-付费演示前在本地 `.env` 配置 `DEEPSEEK_API_KEY`。不要在录屏中打开或输出 `.env`。
+本脚本的零费用路线是**回看已保存任务**：浏览器只读取本地 SQLite，不发模型请求。
+“新建任务”和“执行”按钮会调用真实模型；如果没有事先准备的任务，不能把空页面
+讲成完整的 live demo。W6 的 [fake-client 端到端测试](../tests/test_phase_productization_w6.py)
+独立验证了这些状态迁移，但测试的临时数据库会清理，**它不是界面截图或一次真实模型运行**。
+若日后要现场点击完整流程，应另行准备可信的小仓库、Docker、模型配置和费用预算，
+并如实标注那是付费真实运行；不属于本次零费用演示。
 
-## 0:00～0:40：问题与架构
+## 0:00–0:40：从任务列表进入
 
-打开 README 首屏并说明：
+在首页指出最近任务的 Issue 摘要、状态和更新时间，点开一条确有完整记录的任务。
+一句话介绍：“它把 Issue 转成受审批的本地修复流程，默认不会 push 或创建 GitHub PR。”
+如果演示库目前为空，就明确说没有录屏材料，先不要录制完成态演示。
 
-> 这是一个本地 Issue-to-PR Agent。它不相信模型自己声称“修好了”，而是在受限 Docker
-> 环境里执行工具，再由 Agent 不可见的 hidden tests 独立评测。计划、diff 和人工审批都
-> 绑定内容哈希，最终保留 trace、token、成本和失败原因。
+## 0:40–1:20：展示新建入口与计划审批
 
-强调系统默认不会 push 或创建 PR。
+切到“新建任务”视图，展示本地仓库路径 + Issue 文本、或 GitHub repository + issue number
+两种入口，**零费用回看时不要提交**。回到已有任务，打开 plan artifact，指出目标、
+受影响文件、步骤和允许命令。说明批准的是当前计划的 SHA-256；内容变了必须重审。
 
-## 0:40～1:30：离线回归测试
+## 1:20–2:15：任务详情与执行事件（重点）
 
-```powershell
-python -m pytest -q
-```
+在任务详情中按时间顺序看 `execution_started`、Coder/Reviewer 的 `agent_step`、
+最终 `execution_finished`。指出界面只显示 phase、动作、状态、文件路径等白名单字段，
+不把原始模型文本、源码片段或完整命令输出写进浏览器可读事件。
+执行期间客户端通过单调事件游标轮询；页面刷新只读取任务状态，不擅自重启执行。
+若这条任务出现 `agent_trace_truncated`，必须指出事件已显式截断，不能说 trace 完整。
 
-说明这些测试覆盖：路径越界、命令策略、审批哈希、Docker 参数、隐藏测试隔离、混合检索、
-来源记忆、协议哈希、symbol 读取和失败分类。这个步骤不消耗 API token。
+## 2:15–3:15：完整 diff 与审批对象
 
-## 1:30～2:40：运行一个隔离修复
+打开 diff 视图，翻页查看修改。说明 diff API 返回全文；页面尚未展示完整 diff 时，
+审批按钮被禁用。展示“查看完整 diff”入口和 `diff_review` 审批对象哈希：
+它绑定 **diff + 测试报告 + Reviewer 结论**，不是单独的 diff 内容哈希。
+已有任务若已获批准，只解释当时的审批记录，不重复提交或伪造一次点击。
 
-```powershell
-python -m benchmark.run --cases case01_add --methods single
-```
+## 3:15–4:15：Draft PR 请求和第二道审批
 
-展示生成的 `benchmark/results.md`，说明四个互相独立的信号：
+打开 Draft PR 请求预览，指出目标仓库、base/head 分支、标题以及冻结的
+`diff_review_sha256`。发布审批绑定的是整个 `draft_pr_request` 的哈希，与 diff 审批
+不同。默认流程到 `ready_to_publish` 即停止；UI 中不存在真实 GitHub 发布按钮。
+只有服务显式用 `--fake-publisher` 启动，才会出现“模拟发布”按钮与醒目的模拟徽章；
+它不 commit、不 push、不创建 PR。不要把模拟结果写成真实 GitHub PR。
 
-1. `agent_passed`：Agent 自己是否认为完成；
-2. `tests_pass`：隐藏测试是否真的通过；
-3. `test_tampered` / `source_polluted`：是否作弊或逃逸；
-4. `total_tokens` / `cost_rmb`：完成任务的资源成本。
+## 4:15–5:00：证据与限制
 
-不要反复运行这个命令；录屏前可先准备一条成功结果，现场主要讲解结果文件。
-
-## 2:40～3:40：真实仓库与失败分析
-
-```powershell
-python -m benchmark.analyze_real_results --show-provenance
-```
-
-打开 `docs/FAILURE_ANALYSIS_HANDOFF.md`，说明项目没有把 11 条不同协议的历史运行混成一个
-成功率，而是按“从哪一步开始跑偏”区分：正常收敛、只读不收敛、补丁语义错误、Planner
-未提交计划、修改引入回归。
-
-随后打开 `benchmark/real/experiments/E1_NO_PROGRESS_REPORT.md`，用一句话说明负面实验：
-
-> 无进展提醒听起来合理，但四次 smoke run 没有显示收益，其中一次还推迟了首次有效修改，
-> 因此没有默认启用。
-
-再打开 `benchmark/real/experiments/E2_REPORT.md`，展示 36 条同协议正式运行：B 组观察
-通过率最高且 token 最低，但自动终止真正触发的 3 条只有 1 条通过 hidden tests；加入
-Reviewer/Reviser 的 C 组没有超过 B。强调这是小样本机制验证，不是统计显著结论。
-
-## 3:40～4:30：安全与人工审批
-
-展示 `core/policy.py` 和 `core/workflow.py`：
-
-- Agent 只能提交 argv，不能提交 shell 字符串；
-- pytest/ruff 和只读 Git 命令可以直接运行；
-- commit、push 等状态变更需要审批；
-- 审批绑定计划或 diff 的 SHA-256，内容变化后旧审批失效。
-
-## 4:30～5:00：诚实边界
-
-以三个限制结束：
-
-- 当前真实仓库样本仍小，不能声称具有统计显著性；
-- Multi-Agent 和 RAG 在已有实验中没有提高成功率；
-- 项目目前到 `PR-ready`，还没有默认执行外部 GitHub 写操作。
-
-最后给出下一步：保留确定性终止和 Reviewer/Reviser 的真实负面边界，完成受审批的
-GitHub Issue → 本地计划 → 修改/测试 → Draft PR 闭环；真正创建外部 PR 仍需人工确认。
+最后指出三条边界：真实仓库 benchmark 仍是小样本；Reviewer/Reviser 的现有实验没有
+优于更简单的策略；启动自检只能提示模型配置和 Docker 前提，不能证明凭据有效、
+补丁正确或真实发布成功。若观众要核对实现，转到 README 的 W2–W5 契约索引和
+离线端到端测试；演示结束时不要顺手触发真实外部写操作。
