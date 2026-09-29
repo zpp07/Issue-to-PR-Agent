@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="本地 Issue-to-PR Agent 工作台：查看计划、执行步骤、补丁和审批证据。">
+  <title>Issue-to-PR Agent · 本地工作台</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%230b1524'/%3E%3Cpath d='M13 15h11m-11 9h22M13 33h15' stroke='%235ce1be' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='31' cy='15' r='4' fill='%235ce1be'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">{·}</span><div><strong>Issue-to-PR Agent</strong><small>本地工作台</small></div></div>
+      <div class="top-actions"><span id="connection-status" class="connection-status" aria-live="polite">连接中</span><button id="new-task-button" class="button button-primary" type="button">新建任务</button></div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar" aria-label="任务列表">
+        <div class="sidebar-heading"><div><p class="eyebrow">工作队列</p><h2>任务</h2></div><button id="refresh-list-button" class="icon-button" type="button" aria-label="刷新任务列表" title="刷新任务列表">↻</button></div>
+        <div id="task-list" class="task-list" role="list"><p class="muted empty-list">正在读取任务…</p></div>
+        <div class="sidebar-foot">所有数据保存在本机。页面刷新不会自动重启执行轮询。</div>
+      </aside>
+
+      <main class="main-content">
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+        <section id="create-view" class="view" aria-labelledby="create-title">
+          <div class="view-heading"><p class="eyebrow">开始</p><h1 id="create-title">从 Issue 到可审查的补丁</h1><p>选择一个本地 Git 仓库，写下要解决的问题。Agent 会先给出计划，得到你的批准后才会修改代码。</p></div>
+          <div class="create-card">
+            <div class="segmented" role="tablist" aria-label="任务来源"><button id="mode-local" class="segment active" type="button" role="tab" aria-selected="true">本地 Issue 文本</button><button id="mode-github" class="segment" type="button" role="tab" aria-selected="false">GitHub Issue</button></div>
+            <form id="create-form">
+              <label for="repo-path">本地仓库路径</label>
+              <input id="repo-path" name="repo_path" type="text" required placeholder="D:\\projects\\example-repo" autocomplete="off">
+              <p class="field-hint">必须是本机已有的 Git 仓库；Agent 会在独立工作区中操作。</p>
+              <div id="local-fields"><label for="issue-text">Issue 描述</label><textarea id="issue-text" name="issue" rows="8" placeholder="说明复现步骤、期望行为和边界条件"></textarea></div>
+              <div id="github-fields" hidden><label for="github-repository">GitHub 仓库</label><input id="github-repository" name="repository" type="text" placeholder="owner/repo" autocomplete="off"><label for="github-number">Issue 编号</label><input id="github-number" name="issue_number" type="number" min="1" step="1" placeholder="123"><p class="field-hint">会从 GitHub 读取该 Issue；本地仓库路径仍用于生成和验证补丁。</p></div>
+              <div class="form-actions"><button id="create-submit" class="button button-primary" type="submit">创建任务并生成计划</button><span id="create-feedback" class="muted" aria-live="polite"></span></div>
+            </form>
+          </div>
+        </section>
+
+        <section id="detail-view" class="view" aria-labelledby="detail-title" hidden>
+          <header class="detail-header"><div><p class="eyebrow">任务详情 <span id="detail-id" class="monospace"></span></p><h1 id="detail-title">任务</h1><p id="detail-issue" class="detail-issue"></p></div><div class="detail-actions"><span id="detail-status" class="status-badge"></span><button id="refresh-task-button" class="button button-subtle" type="button">刷新状态</button></div></header>
+          <nav class="detail-tabs" aria-label="任务阶段"><button class="detail-tab active" data-tab="plan" type="button">01 · 计划</button><button class="detail-tab" data-tab="progress" type="button">02 · 实时步骤</button><button class="detail-tab" data-tab="diff" type="button">03 · Diff 审批</button><button class="detail-tab" data-tab="draft" type="button">04 · Draft PR</button></nav>
+
+          <section id="panel-plan" class="stage-panel" aria-labelledby="plan-title"><div class="stage-heading"><div><p class="eyebrow">先审计划，再动代码</p><h2 id="plan-title">修改计划</h2></div><span id="plan-state" class="stage-state"></span></div><div id="plan-content" class="panel-body muted">正在读取计划…</div><div id="plan-actions" class="action-bar" hidden><span id="plan-hash" class="hash-label"></span><div><button id="reject-plan-button" class="button button-danger" type="button">拒绝计划</button><button id="approve-plan-button" class="button button-primary" type="button">批准计划</button></div></div></section>
+
+          <section id="panel-progress" class="stage-panel" aria-labelledby="progress-title" hidden><div class="stage-heading"><div><p class="eyebrow">透明执行</p><h2 id="progress-title">实时步骤</h2></div><span id="progress-state" class="stage-state"></span></div><div id="execute-controls" class="execute-controls"><div><label for="target-file">目标文件</label><select id="target-file"></select><p class="field-hint">来自已批准计划的 affected_files，可在执行前切换。</p></div><div><label for="max-rounds">最多轮数</label><select id="max-rounds"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option></select></div><button id="execute-button" class="button button-primary" type="button">开始执行</button></div><p id="progress-hint" class="muted"></p><ol id="step-list" class="step-list" aria-live="polite" aria-relevant="additions"></ol></section>
+
+          <section id="panel-diff" class="stage-panel" aria-labelledby="diff-title" hidden><div class="stage-heading"><div><p class="eyebrow">审批对象 = diff + 测试报告 + 审查</p><h2 id="diff-title">补丁审查</h2></div><span id="diff-state" class="stage-state"></span></div><div id="diff-empty" class="panel-body muted">执行完成后，这里会显示完整补丁。</div><div id="diff-content" hidden><div id="review-evidence" class="evidence-grid"></div><div class="diff-toolbar"><span id="diff-size" class="muted"></span><div><button id="diff-prev" class="button button-subtle" type="button">上一页</button><span id="diff-page-label" class="page-label"></span><button id="diff-next" class="button button-subtle" type="button">下一页</button><button id="diff-full-button" class="button button-subtle" type="button">查看完整 diff</button></div></div><div id="diff-lines" class="diff-lines" role="region" aria-label="补丁内容"></div><div class="action-bar"><div class="approval-identifiers"><span>内容哈希 <code id="diff-content-hash"></code></span><span>审批对象 <code id="diff-approval-hash"></code></span></div><div><button id="reject-diff-button" class="button button-danger" type="button" disabled>拒绝 diff</button><button id="approve-diff-button" class="button button-primary" type="button" disabled>批准 diff</button></div></div><p id="diff-gate-hint" class="field-hint"></p></div></section>
+
+          <section id="panel-draft" class="stage-panel" aria-labelledby="draft-title" hidden><div class="stage-heading"><div><p class="eyebrow">冻结请求，单独审批</p><h2 id="draft-title">Draft PR 请求</h2></div><span id="draft-state" class="stage-state"></span></div><div id="draft-form-wrap"><p class="muted">diff 获批后填写发布目标。冻结请求不会提交、推送或创建 GitHub PR。</p><form id="draft-form" class="draft-form"><div><label for="draft-repository">GitHub 仓库</label><input id="draft-repository" required placeholder="owner/repo"></div><div><label for="draft-base">目标分支</label><input id="draft-base" required value="main"></div><div><label for="draft-head">工作分支</label><input id="draft-head" required placeholder="agent/fix-issue"></div><div><label for="draft-remote">Git remote</label><input id="draft-remote" required value="origin"></div><div class="full-width"><label for="draft-title-input">PR 标题</label><input id="draft-title-input" required maxlength="256"></div><div class="full-width"><label for="draft-body">PR 正文（留空则由验证结果生成）</label><textarea id="draft-body" rows="5"></textarea></div><div class="full-width"><label for="draft-commit">Commit 信息（可留空）</label><input id="draft-commit" maxlength="256"></div><div class="full-width form-actions"><span class="draft-flag">draft = true</span><button id="freeze-request-button" class="button button-primary" type="submit">冻结 Draft PR 请求</button></div></form></div><div id="draft-preview" hidden><div id="draft-request-fields" class="request-fields"></div><div class="action-bar"><span id="publish-hash" class="hash-label"></span><div><button id="reject-publish-button" class="button button-danger" type="button">拒绝发布请求</button><button id="approve-publish-button" class="button button-primary" type="button">批准发布请求</button></div></div></div><div id="ready-panel" class="ready-panel" hidden><strong>发布请求已批准</strong><p>当前停在 <code>ready_to_publish</code>。此界面默认不会提交、推送或创建真实 GitHub PR。</p><button id="simulate-button" class="button button-primary" type="button" hidden>模拟发布 Draft PR</button></div><div id="simulated-panel" class="simulated-panel" hidden><span class="simulated-badge">模拟发布 · 没有创建真实 PR</span><p id="simulated-detail"></p></div></section>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="full-diff-dialog" class="full-diff-dialog" aria-labelledby="full-diff-title"><div class="dialog-heading"><div><p class="eyebrow">完整内容 · 不截断</p><h2 id="full-diff-title">完整 diff</h2></div><button id="close-diff-dialog" class="button button-subtle" type="button">关闭</button></div><pre id="full-diff-text"></pre></dialog>
+</body>
+</html>

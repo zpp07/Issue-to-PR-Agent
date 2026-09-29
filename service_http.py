@@ -6,6 +6,7 @@ the project scope is a single-user local prototype.
 """
 from __future__ import annotations
 
+import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -15,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 from core.audit import TaskStore
 from core.client import make_client
 from core.execution import ExecutionManager
+from core.fake_publisher import FakeDraftPRPublisher
 from core.github import GitHubAPI, GitHubDraftPRPublisher
 from core.read_views import artifact_content, artifact_list, task_page
 from core.sandbox import DockerSandbox
@@ -22,6 +24,13 @@ from core.workflow import IssueToPRWorkflow
 from issue_to_pr import IssueToPRService, PlanningUnavailable
 
 ROOT = Path(__file__).parent
+WEB_DIR = ROOT / "web"
+STATIC_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+}
+FAKE_PUBLISHER_MODE = False
 configured_data_dir = os.environ.get("AGENT_DATA_DIR")
 DATA_DIR = Path(configured_data_dir).resolve() if configured_data_dir else (ROOT / ".local").resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,6 +49,23 @@ execution_manager = ExecutionManager(store, service)
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _static(self, path):
+        filename, content_type = STATIC_FILES[path]
+        content = (WEB_DIR / filename).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; "
+            "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+            "form-action 'self'; frame-ancestors 'none'",
+        )
+        self.end_headers()
+        self.wfile.write(content)
+
     def _body(self):
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length) or b"{}")
@@ -56,6 +82,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urlsplit(self.path)
             parts = parsed.path.strip("/").split("/")
+            if parsed.path in STATIC_FILES:
+                return self._static(parsed.path)
+            if parsed.path == "/ui-config":
+                return self._reply(200, {"fake_publisher": FAKE_PUBLISHER_MODE})
             if parts == ["tasks"]:
                 query = parse_qs(parsed.query, keep_blank_values=True)
                 limit = int(query.get("limit", ["50"])[0])
@@ -124,9 +154,18 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._reply(200, store.task(parts[1]))
             if len(parts) == 4 and parts[0] == "tasks" and parts[2:] == ["draft-pr", "publish"]:
+                if FAKE_PUBLISHER_MODE:
+                    return self._reply(403, {"detail": "模拟模式禁止真实发布"})
                 result = workflow.publish_draft_pr(
                     parts[1], body["subject_hash"],
                     GitHubDraftPRPublisher(GitHubAPI.from_env()),
+                )
+                return self._reply(200, result)
+            if len(parts) == 4 and parts[0] == "tasks" and parts[2:] == ["draft-pr", "simulate"]:
+                if not FAKE_PUBLISHER_MODE:
+                    return self._reply(404, {"detail": "not found"})
+                result = workflow.publish_draft_pr(
+                    parts[1], body["subject_hash"], FakeDraftPRPublisher(),
                 )
                 return self._reply(200, result)
             if len(parts) == 4 and parts[0] == "tasks" and parts[2:] == ["memories", "facts"]:
@@ -147,6 +186,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Local Issue-to-PR API and UI")
+    parser.add_argument("--fake-publisher", action="store_true",
+                        help="Enable a no-network simulated Draft PR publication button")
+    FAKE_PUBLISHER_MODE = parser.parse_args().fake_publisher
     execution_manager.recover_interrupted()
-    print("Issue-to-PR local API: http://127.0.0.1:8765")
+    print("Issue-to-PR local UI: http://127.0.0.1:8765")
+    if FAKE_PUBLISHER_MODE:
+        print("Fake publisher enabled: simulation only; real publish API disabled")
     ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
