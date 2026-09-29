@@ -10,7 +10,10 @@
 运行：
     python coder_reviewer.py   # 从 multi-agent 目录运行
 """
+from __future__ import annotations
+
 import os
+from typing import Any, Callable
 
 from core.client import make_client
 from core.agent import run_agent
@@ -45,7 +48,8 @@ REVIEWER_PROMPT = """你是一个认真负责的代码审查员。
 def multi_agent_review(client, target_file, task="修复代码中的 bug",
                        max_rounds=3, model="deepseek-chat",
                        usage=None, trace=None, verbose=True, executor=None,
-                       workspace=None, coder_tools=None, reviewer_tools=None):
+                       workspace=None, coder_tools=None, reviewer_tools=None,
+                       on_event: Callable[[dict[str, Any]], None] | None = None):
     """Coder 修 → Reviewer 查 → 不通过喂回意见，最多 max_rounds 轮。
 
     返回 (passed, review_issues, rounds, usage)。
@@ -60,6 +64,15 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
     coder_tools = coder_tools or CODERS
     reviewer_tools = reviewer_tools or REVIEWERS
 
+    def phase_callback(phase: str, round_num: int):
+        if on_event is None:
+            return None
+
+        def emit(record: dict[str, Any]) -> None:
+            on_event({**record, "phase": phase, "round": round_num})
+
+        return emit
+
     for round_num in range(1, max_rounds + 1):
         if verbose:
             print(f"\n{'='*20} 第 {round_num} 轮 {'='*20}")
@@ -73,6 +86,7 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
             client, CODER_PROMPT, coder_tools, coder_task,
             model=model, usage=usage, trace=trace,
             execute_tool=coder_executor,
+            on_event=phase_callback("coder", round_num),
         )
         if verbose:
             print(f"[Coder] 完成：{str(coder_result)[:80]}")
@@ -86,6 +100,7 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
             f"请审查文件 {target_display} 的代码",
             model=model, usage=usage, trace=trace,
             execute_tool=review_executor,
+            on_event=phase_callback("reviewer", round_num),
         )
         if isinstance(review, dict):
             passed = bool(review.get("passed"))

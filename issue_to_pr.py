@@ -25,6 +25,61 @@ PLANNER_PROMPT = """你是 Python 项目的变更规划员。先阅读与 issue 
 ["git", "status"]、["git", "diff"]。绝不能运行 python 文件、shell、网络或写 Git 命令。
 不确定的文件或风险应明确写出，不要编造。"""
 
+# This is a limit on browser-visible progress events, not on audit/status events.
+MAX_PROGRESS_EVENTS_PER_TASK = 2000
+_PUBLIC_ACTIONS = {
+    "search_code", "read_file", "read_symbol", "write_file", "replace_text",
+    "run_command", "finish", "review_finish", "plan_finish", "progress_decision",
+    "no_progress_intervention", "controller_finish", "llm_error", "text", "agent_exit",
+}
+_PUBLIC_STATUSES = {"ok", "error", "blocked", "rejected"}
+_PUBLIC_EXIT_REASONS = {
+    "llm_error", "max_tokens", "max_cost", "free_text", "no_progress",
+    "verified_patch", "finish", "max_steps_unverified_patch", "max_steps_no_patch",
+}
+
+
+def _public_agent_event(record: dict[str, Any]) -> dict[str, Any]:
+    """Project a raw Agent trace record onto the local HTTP event schema."""
+    action = record.get("action")
+    phase = record.get("phase")
+    payload: dict[str, Any] = {
+        "phase": phase if isinstance(phase, str) and phase in {"coder", "reviewer"} else "unknown",
+        "action": action if isinstance(action, str) and action in _PUBLIC_ACTIONS else "other",
+    }
+    for key in ("round", "step", "result_chars", "command_exit_code",
+                "patch_revision", "remaining_steps", "threshold"):
+        value = record.get(key)
+        if type(value) is int:
+            payload[key] = value
+    status = record.get("status")
+    if isinstance(status, str) and status in _PUBLIC_STATUSES:
+        payload["status"] = status
+    exit_reason = record.get("exit_reason")
+    if isinstance(exit_reason, str) and exit_reason in _PUBLIC_EXIT_REASONS:
+        payload["exit_reason"] = exit_reason
+    for key in ("mutation_applied", "retryable"):
+        value = record.get(key)
+        if type(value) is bool:
+            payload[key] = value
+
+    args = record.get("args")
+    if isinstance(args, dict):
+        path = args.get("path")
+        if isinstance(path, str) and len(path) <= 256:
+            candidate = Path(path)
+            if (not candidate.is_absolute() and not candidate.drive
+                    and ".." not in path.replace("\\", "/").split("/")):
+                payload["path"] = path
+        for key in ("start_line", "end_line"):
+            value = args.get(key)
+            if type(value) is int and value > 0:
+                payload[key] = value
+        choice = args.get("choice")
+        if choice in ("minimal_edit", "targeted_read", "abandon", "finish"):
+            payload["choice"] = choice
+    return payload
+
 
 class PlanningUnavailable(RuntimeError):
     """The task/worktree exists, but the LLM plan can safely be retried later."""
@@ -105,6 +160,7 @@ class IssueToPRService:
             max_rounds=max_rounds,
             model=self.model, verbose=False, executor=executor, workspace=workspace,
             coder_tools=SEARCH_CODER_TOOLS, reviewer_tools=SEARCH_REVIEWER_TOOLS,
+            on_event=self._execution_event_callback(task_id),
         )
         # Prefer the conventional target-specific test.  It prevents unrelated
         # benchmark fixtures with duplicate names from poisoning independent
@@ -133,6 +189,28 @@ class IssueToPRService:
                   "tokens": usage.total_tokens, "tests_exit_code": test_code,
                   "test_argv": test_argv}
         return self.workflow.record_execution(task_id, test_report, review)
+
+    def _execution_event_callback(self, task_id: str):
+        """Persist bounded, public progress; keep all other audit events intact."""
+        events = self.workflow.store.events(task_id)
+        emitted = sum(event["event_type"] == "agent_step" for event in events)
+        truncated = any(event["event_type"] == "agent_trace_truncated" for event in events)
+
+        def persist(record: dict[str, Any]) -> None:
+            nonlocal emitted, truncated
+            if emitted >= MAX_PROGRESS_EVENTS_PER_TASK:
+                if not truncated:
+                    self.workflow.store.event(task_id, "agent_trace_truncated", {
+                        "limit": MAX_PROGRESS_EVENTS_PER_TASK,
+                        "reason": "progress_event_limit",
+                        "further_progress_events_omitted": True,
+                    })
+                    truncated = True
+                return
+            self.workflow.store.event(task_id, "agent_step", _public_agent_event(record))
+            emitted += 1
+
+        return persist
 
     def _task_with_memory(self, task_id: str, task: str) -> str:
         memory = self.workflow.memory.render_context(task_id)

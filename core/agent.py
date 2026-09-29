@@ -13,9 +13,12 @@ Phase 1 新增可靠性：
 7. token / step / 成本三重预算上限
 8. 结构化日志 + request_id（可观测）
 """
+from __future__ import annotations
+
 import json
 import logging
 import uuid
+from typing import Any, Callable
 
 try:
     import openai
@@ -102,6 +105,7 @@ def run_agent(
     auto_finish_after_verified_patch=False,
     final_step_tool_names=None,
     terminal_tool_reserve=1,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ):
     """
     通用 agent 循环。
@@ -116,6 +120,8 @@ def run_agent(
         execute_tool 工具执行函数（默认 core.tools.execute_tool，可传入自定义）
         usage        Usage 实例（外部传入可跨 agent 累计）
         trace        list（外部传入，记录每步动作，用于观测）
+        on_event     可选的同步回调；收到已完成的 trace 同构记录，并在正常
+                     Python 退出路径收到唯一的 agent_exit（不写入历史 trace）
         max_tokens   token 预算上限（可选，超过则停止）
         max_cost_rmb 成本预算上限（元，可选，超过则停止）
 
@@ -131,6 +137,8 @@ def run_agent(
 
     def set_exit(reason):
         run_state["exit_reason"] = reason
+        if on_event is not None:
+            on_event({"action": "agent_exit", "exit_reason": reason})
 
     successful_mutation = False
     successful_mutations = 0
@@ -194,6 +202,8 @@ def run_agent(
             }
             if trace is not None:
                 trace.append(intervention)
+            if on_event is not None:
+                on_event(dict(intervention))
             run_state["no_progress"] = intervention
         terminal_start = max(0, max_steps - max(1, int(terminal_tool_reserve)))
         if final_step_prompt and step == terminal_start:
@@ -221,9 +231,13 @@ def run_agent(
             )
         except LLMCallError as exc:
             log.error("LLM 调用失败 run_id=%s retryable=%s: %s", run_id, exc.retryable, exc)
-            if trace is not None:
-                trace.append({"step": step, "action": "llm_error", "retryable": exc.retryable,
-                              "error": str(exc), "status": "error"})
+            if trace is not None or on_event is not None:
+                error_event = {"step": step, "action": "llm_error", "retryable": exc.retryable,
+                               "error": str(exc), "status": "error"}
+                if trace is not None:
+                    trace.append(error_event)
+                if on_event is not None:
+                    on_event(dict(error_event))
             set_exit("llm_error")
             return {"result": f"LLM 调用失败：{exc}", "retryable": exc.retryable}, usage
         usage.add(pt, ct)
@@ -244,10 +258,14 @@ def run_agent(
         tool_calls = getattr(message, "tool_calls", None)
         if not tool_calls:
             # 兜底：自由文本输出当作完成
-            if trace is not None:
-                trace.append({"step": step, "action": "text", "content": getattr(message, "content", None),
+            if trace is not None or on_event is not None:
+                text_event = {"step": step, "action": "text", "content": getattr(message, "content", None),
                               "request_id": request_id, "provider_request_id": provider_request_id,
-                              "status": "ok"})
+                              "status": "ok"}
+                if trace is not None:
+                    trace.append(text_event)
+                if on_event is not None:
+                    on_event(dict(text_event))
             if intervention is not None and "choice" not in intervention:
                 intervention["choice"] = "abandon"
                 intervention["next_action"] = "text"
@@ -261,11 +279,12 @@ def run_agent(
                 args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError as e:
                 args = {"result": f"参数解析失败：{e}"}
-            if trace is not None:
+            if trace is not None or on_event is not None:
                 trace_record = {"step": step, "action": name, "args": args,
                                 "request_id": request_id,
                                 "provider_request_id": provider_request_id}
-                trace.append(trace_record)
+                if trace is not None:
+                    trace.append(trace_record)
             else:
                 trace_record = None
 
@@ -339,6 +358,8 @@ def run_agent(
                     if choice in {"minimal_edit", "targeted_read"}:
                         pending_direction = choice
                 if intervention is not None and choice in {"abandon", "finish"}:
+                    if on_event is not None:
+                        on_event(dict(trace_record))
                     set_exit("no_progress")
                     return {
                         "result": args.get("reason", "no-progress terminal decision"),
@@ -380,12 +401,18 @@ def run_agent(
                     }
                     if trace is not None:
                         trace.append(controller_event)
+                    if on_event is not None:
+                        on_event(dict(trace_record))
+                        on_event(dict(controller_event))
                     set_exit("verified_patch")
                     return {
                         "result": "最新补丁已通过修改后的 pytest，控制器结束运行",
                         "auto_finished": True,
                         "completion_evidence": evidence,
                     }, usage
+
+            if on_event is not None:
+                on_event(dict(trace_record))
 
             # 终态工具：finish / review_finish / plan_finish —— 立即返回结构化结果
             if name in ("finish", "review_finish", "plan_finish") and not rejected_as_unavailable:
