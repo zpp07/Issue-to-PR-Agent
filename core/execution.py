@@ -1,7 +1,9 @@
 """Single-process background execution and durable SQLite event polling."""
 from __future__ import annotations
 
+import sys
 from threading import Thread
+import traceback
 from typing import Any, Callable
 
 from core.audit import TaskStore
@@ -27,7 +29,7 @@ class ExecutionManager:
         try:
             worker.start()
         except Exception as exc:
-            self._fail(task_id, type(exc).__name__)
+            self._fail(task_id, exc)
             raise
         return {
             "task_id": task_id,
@@ -48,11 +50,12 @@ class ExecutionManager:
                 "validation": result.get("validation") if isinstance(result, dict) else None,
             })
         except Exception as exc:
-            self._fail(task_id, type(exc).__name__)
+            self._fail(task_id, exc)
 
-    def _fail(self, task_id: str, error_type: str) -> None:
+    def _fail(self, task_id: str, exc: Exception) -> None:
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
         if self.store.transition_status(task_id, "executing", "execution_failed"):
-            self.store.event(task_id, "execution_failed", {"error_type": error_type})
+            self.store.event(task_id, "execution_failed", {"error_type": type(exc).__name__})
 
     def recover_interrupted(self) -> list[str]:
         return self.store.recover_interrupted_executions()

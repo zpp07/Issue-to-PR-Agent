@@ -16,6 +16,7 @@ from core.audit import TaskStore
 from core.client import make_client
 from core.execution import ExecutionManager
 from core.github import GitHubAPI, GitHubDraftPRPublisher
+from core.read_views import artifact_content, artifact_list, task_page
 from core.sandbox import DockerSandbox
 from core.workflow import IssueToPRWorkflow
 from issue_to_pr import IssueToPRService, PlanningUnavailable
@@ -55,11 +56,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urlsplit(self.path)
             parts = parsed.path.strip("/").split("/")
+            if parts == ["tasks"]:
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                limit = int(query.get("limit", ["50"])[0])
+                offset = int(query.get("offset", ["0"])[0])
+                return self._reply(200, task_page(store, limit, offset))
             if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "events":
                 query = parse_qs(parsed.query, keep_blank_values=True)
                 after = int(query.get("after", ["0"])[0])
                 limit = int(query.get("limit", ["100"])[0])
                 return self._reply(200, execution_manager.event_page(parts[1], after, limit))
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "artifacts":
+                return self._reply(200, artifact_list(store, parts[1]))
+            if len(parts) == 4 and parts[0] == "tasks" and parts[2] == "artifacts":
+                return self._reply(200, artifact_content(store, parts[1], parts[3]))
             if len(parts) == 2 and parts[0] == "tasks":
                 task_id = parts[1]
                 return self._reply(200, {"task": store.task(task_id), "events": store.events(task_id)})

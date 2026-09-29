@@ -13,6 +13,7 @@ from core.audit import TaskStore
 from core.client import make_client
 from core.execution import ExecutionManager
 from core.github import GitHubAPI, GitHubDraftPRPublisher, GitHubError
+from core.read_views import artifact_content, artifact_list, task_page
 from core.sandbox import DockerSandbox
 from core.workflow import IssueToPRWorkflow
 
@@ -186,6 +187,30 @@ def publish_draft_pr(task_id: str, request: PublishRequest):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except (KeyError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/tasks")
+def list_tasks(limit: int = 50, offset: int = 0):
+    try:
+        return task_page(store, limit, offset)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/tasks/{task_id}/artifacts")
+def list_artifacts(task_id: str):
+    try:
+        return artifact_list(store, task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/tasks/{task_id}/artifacts/{kind}")
+def get_artifact(task_id: str, kind: str):
+    try:
+        return artifact_content(store, task_id, kind)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/tasks/{task_id}")

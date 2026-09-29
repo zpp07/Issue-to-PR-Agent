@@ -9,6 +9,8 @@
 `AUTOINCREMENT` 序号：严格递增、重启后稳定，不要求同一任务的序号连续。
 `limit` 限于 1–200。响应包含 `events`、`next_after`、`has_more`、任务 `status`
 和 `execution_done`。
+轮询只应由 `POST /execute` 的 202 响应启动。页面加载或刷新时应改用
+`GET /tasks/{id}` 读取状态，不要自动开始轮询。
 
 **轮询停止条件只有 `execution_done=true`。** 它要求最新一次
 `execution_started` 之后已有 `execution_finished`、`execution_failed` 或

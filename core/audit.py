@@ -87,6 +87,19 @@ class TaskStore:
             raise KeyError(f"未知 task_id：{task_id}")
         return dict(row)
 
+    def list_tasks(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit 必须在 1–100 之间")
+        if type(offset) is not int or not 0 <= offset <= 9_223_372_036_854_775_807:
+            raise ValueError("offset 必须是 SQLite 整数范围内的非负整数")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, issue, status, created_at, updated_at FROM tasks "
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def set_status(self, task_id: str, status: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?", (status, _now(), task_id))
@@ -189,7 +202,8 @@ class TaskStore:
     def latest_artifact(self, task_id: str, kind: str) -> dict[str, Any]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM artifacts WHERE task_id=? AND kind=? ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM artifacts WHERE task_id=? AND kind=? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (task_id, kind),
             ).fetchone()
         if row is None:
