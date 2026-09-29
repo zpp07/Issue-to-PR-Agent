@@ -38,7 +38,7 @@ token 变化 +38.7%。
 - `verified_patch` 只触发 3/12 次，且都发生在 Pydantic；
   其中 hidden pass 为 1/3。
 - 控制器证明的是“最新补丁之后某个可见 pytest 命令退出码为 0”，不是完整任务正确。
-  两条隐藏测试失败说明终止证据仍可能过窄，不能把 `verified_patch` 命名理解为
+  2 条隐藏测试失败说明终止证据仍可能过窄，不能把 `verified_patch` 命名理解为
   evaluator 已验证的补丁。
 - B 的总 token 明显低于 A，但由于三组不是共享随机种子的配对实验，不能把全部
   token 差异或通过率差异都归因于控制器。

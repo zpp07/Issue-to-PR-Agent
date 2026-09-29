@@ -4,7 +4,10 @@ import subprocess
 
 import pytest
 
-from benchmark.analyze_e2 import load_rows, summarize_arm, validate_rows, wilson_interval
+from benchmark.analyze_e2 import (
+    DEFAULT_RESULTS, load_rows, markdown_report, summarize_arm, validate_rows,
+    wilson_interval,
+)
 from core.audit import TaskStore
 from core.github import GitHubAPI, GitHubError, repository_from_remote
 from core.workflow import IssueToPRWorkflow
@@ -64,6 +67,37 @@ def test_validate_rejects_duplicate_run_key(tmpdir):
 
     with pytest.raises(ValueError, match="duplicate run key"):
         validate_rows(load_rows(path))
+
+
+def test_strict_e2_validation_checks_frozen_hashes_and_manifest_content():
+    rows = load_rows()
+    validate_rows(rows, strict=True)
+
+    changed_hash = [dict(row) for row in rows]
+    changed_hash[0]["protocol_hash"] = "different"
+    with pytest.raises(ValueError, match="frozen protocol hash mismatch"):
+        validate_rows(changed_hash, strict=True)
+
+    changed_definition = [dict(row) for row in rows]
+    changed_definition[0]["evaluation_protocol"] = {
+        **changed_definition[0]["evaluation_protocol"], "pass_to_pass_sample": 6,
+    }
+    with pytest.raises(ValueError, match="evaluation protocol content hash mismatch"):
+        validate_rows(changed_definition, strict=True)
+
+
+def test_e2_report_matches_frozen_artifact_and_guards_qualitative_claims():
+    rows = load_rows()
+    metadata = validate_rows(rows, strict=True)
+    expected = Path("benchmark/real/experiments/E2_REPORT.md").read_text(encoding="utf-8")
+    assert markdown_report(rows, metadata) == expected
+
+    changed = [dict(row) for row in rows]
+    controller = next(row for row in changed if row["arm"] == "B"
+                      and row.get("exit_reason") == "verified_patch")
+    controller["case"] = "facebookresearch__hydra-1791"
+    with pytest.raises(ValueError, match="Pydantic"):
+        markdown_report(changed, metadata)
 
 
 def _git(repo, *args):

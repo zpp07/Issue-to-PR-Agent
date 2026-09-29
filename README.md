@@ -34,9 +34,10 @@ flowchart LR
 | 可审计记忆 | 只保存带来源和文件哈希的事实 | `core/memory.py` |
 | 实证评测 | toy/harder/真实仓库三层 benchmark | `benchmark/` |
 
-截至 2026-09-22，确定性测试基线为 **70 passed**。真实仓库历史账本包含 11 次混合协议
-运行；项目明确保留 Multi-Agent、RAG 和无进展干预未带来稳定收益的负面结果，不把小样本
-包装成能力提升。
+截至 2026-09-23，确定性测试基线为 **72 passed**。真实仓库评测累计保留 **54 条运行记录**：
+历史混合协议账本 11 条、E1 4 条、E2 pilot 3 条，以及同一 v6 冻结协议的 E2 正式运行
+**36 条**。这些记录不能混算成功率；项目保留 Multi-Agent、RAG 和无进展干预未带来稳定
+收益的负面结果，不把小样本包装成能力提升。
 
 ## 快速开始（无需 API key）
 
@@ -218,6 +219,8 @@ pass 只有 1/3：可见 pytest 通过仍可能是假收敛。C 比 B 多用 38.
 通过率，因此 Reviewer/Reviser 保持可选而不默认开启。样本很小、没有显式随机种子，不能作
 显著性或因果结论。完整账本、协议和可复现统计见
 [`benchmark/real/experiments/E2_REPORT.md`](benchmark/real/experiments/E2_REPORT.md)。
+v6 检索配置的历史记录缺口与不改写冻结哈希的处理方式见
+[`docs/PROTOCOL_V6_ERRATA.md`](docs/PROTOCOL_V6_ERRATA.md)。
 
 ## Phase 5：有来源的任务记忆
 

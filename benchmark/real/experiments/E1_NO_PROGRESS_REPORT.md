@@ -25,6 +25,12 @@ estimate or a statistical comparison.
 | dvc-4124 | on | fail | `finish` | 265,896 | step 3 | not triggered |
 | dvc-4185 | on | pass | `finish` | 95,284 | step 2 | not triggered |
 
+At the recorded runtime revision `08a9d2d`, `max_steps` meant only that the
+agent loop exhausted its 25 turns. It did not distinguish an edited from an
+unedited workspace or a visibly verified from an unverified patch. Both
+Pydantic rows happened to contain successful edits, but the old exit label
+must not be mechanically mapped to either later `max_steps_*` value.
+
 Total: **1,522,365 tokens**, estimated **RMB 3.1633**, four runs in 12.6 minutes.
 
 ## Interpretation

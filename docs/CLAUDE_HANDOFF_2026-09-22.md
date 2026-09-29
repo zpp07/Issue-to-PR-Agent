@@ -8,10 +8,10 @@
 ## 0. 先确认仓库状态
 
 - GitHub：`https://github.com/zpp07/Issue-to-PR-Agent`
-- 分支：`phase4.5-real-benchmark`
+- 当前检出分支：`master`（本交接最初写于 `phase4.5-real-benchmark`）
 - 本阶段主体提交：`3caffcf feat: complete E2 and add approved draft PR flow`
 - E2 正式运行代码版本：`189bd42542196f616072c8692a9b57036524ddb9`
-- 当前离线测试基线：`70 passed`
+- 当前离线测试基线：`72 passed`（2026-09-23 增加两项 E2 冻结校验）
 - 当前定位：可用于 Agent 开发实习展示的研究型工程原型，不是无人监管的生产机器人。
 
 阅读时不要打开或输出 `.env`，不要寻找 API key，不要运行任何付费模型实验。E2 的 36 条
@@ -77,7 +77,7 @@ metadata 返回，不再靠解析一段自由文本猜退出码。
 主要入口：
 
 - `benchmark/real_run.py::run_review_revise`
-- `benchmark/real_run.py::run_one`
+- `benchmark/real_run.py::evaluate_one`
 - `core/tools.py` 中的 `review_finish`
 - `tests/test_phase46.py`
 
@@ -151,8 +151,12 @@ completion evidence。三组协议 manifest 位于 `benchmark/real/protocols/`�
 - C 比 B 多 38.7% token，观察通过率反而更低，所以不默认开启 Reviewer/Reviser；
 - 每组只有 12 条，区间很宽，只能做机制诊断，不能声称统计显著提升。
 
-`benchmark/analyze_e2.py --strict` 会验证 36 条矩阵、重复键、协议漂移、代码 revision、
-工作树干净状态和 hidden-test 隔离，再生成 Wilson 区间与机制分解。它不调用模型或 Docker。
+`benchmark/analyze_e2.py --strict` 会验证 36 条矩阵、重复键、冻结的协议哈希与 manifest、
+代码 revision、工作树干净状态，以及账本中 `hidden_tests_visible_to_agent=false` 的记录，
+再生成 Wilson 区间与机制分解。该字段校验本身不能证明隔离实现；隔离边界还需结合
+`benchmark/real_run.py::evaluate_one` 的执行顺序检查。它不调用模型或 Docker。
+v6 manifest 的检索字段并未完整记载初始检索参数和非 Python 切块上限，见
+`docs/PROTOCOL_V6_ERRATA.md`；不要为补充说明而改写冻结哈希。
 
 ### 2.5 GitHub Issue → Draft PR 闭环
 
@@ -228,7 +232,7 @@ completion evidence。三组协议 manifest 位于 `benchmark/real/protocols/`�
 - 候选补丁后的 Reviewer/Reviser；
 - 36 条同协议 E2 和可复现分析；
 - 受双重审批保护的 GitHub Draft PR 代码路径；
-- 70 个离线回归测试。
+- 72 个离线回归测试（原阶段完成时为 70 个，后补两项 E2 校验）。
 
 仍未完成：
 

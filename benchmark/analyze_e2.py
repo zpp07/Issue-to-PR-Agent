@@ -8,6 +8,8 @@ import math
 from pathlib import Path
 from statistics import median
 
+from benchmark.protocol import canonical_hash
+
 
 DEFAULT_RESULTS = Path(
     "benchmark/real/experiments/e2_v6_completion_review_2026-09-22.jsonl"
@@ -23,6 +25,14 @@ ARM_DESCRIPTIONS = {
     "B": "single / verified auto-finish",
     "C": "Reviewer + at most one Reviser",
 }
+FROZEN_CODE_REVISION = "189bd42542196f616072c8692a9b57036524ddb9"
+FROZEN_EVALUATION_HASH = "19b8930fb4e55d2f188bde0e1a3d137a19a4b66d9e8d32e5511e9fb99b55a513"
+FROZEN_PROTOCOL_HASHES = {
+    "A": "efa5e5d7ab76c821c56e085f5cb096ccebde7cb2a5d9842b2ddf3eceaceb3a3f",
+    "B": "6edd0c7f5df6157e39c3f758f48dbffebd4861af27a4167a2157d8f228bf48b5",
+    "C": "75bac88eaee1423126ead0b042df9ebbd74a81a509eb77443702996f71629d68",
+}
+FROZEN_PROTOCOL_DIR = Path(__file__).resolve().parent / "real" / "protocols"
 
 
 def load_rows(path: str | Path = DEFAULT_RESULTS) -> list[dict]:
@@ -73,6 +83,33 @@ def validate_rows(rows: list[dict], *, strict: bool = False) -> dict:
         problems.append(f"evaluation protocol drift: {sorted(evaluation_hashes)}")
 
     if strict:
+        if revisions != {FROZEN_CODE_REVISION}:
+            problems.append("frozen code revision mismatch")
+        if evaluation_hashes != {FROZEN_EVALUATION_HASH}:
+            problems.append("frozen evaluation protocol hash mismatch")
+        for arm, protocol in ARM_PROTOCOLS.items():
+            expected_hash = FROZEN_PROTOCOL_HASHES[arm]
+            if protocol_hashes[protocol] != {expected_hash}:
+                problems.append(f"frozen protocol hash mismatch for arm {arm}")
+            manifest_path = FROZEN_PROTOCOL_DIR / (
+                f"{expected_hash}-{FROZEN_EVALUATION_HASH}.json"
+            )
+            if not manifest_path.is_file():
+                problems.append(f"missing frozen protocol manifest for arm {arm}")
+                continue
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (manifest.get("protocol_version") != protocol
+                    or manifest.get("protocol_hash") != expected_hash
+                    or canonical_hash(manifest.get("protocol")) != expected_hash
+                    or manifest.get("evaluation_protocol_hash") != FROZEN_EVALUATION_HASH
+                    or canonical_hash(manifest.get("evaluation_protocol")) != FROZEN_EVALUATION_HASH):
+                problems.append(f"frozen protocol manifest mismatch for arm {arm}")
+        for row in rows:
+            if canonical_hash(row.get("evaluation_protocol")) != FROZEN_EVALUATION_HASH:
+                problems.append(
+                    f"evaluation protocol content hash mismatch for "
+                    f"{row.get('case')} trial {row.get('trial')}"
+                )
         expected_cases = {
             "iterative__dvc-4124",
             "iterative__dvc-4185",
@@ -173,14 +210,42 @@ def _delta_percent(current: float, baseline: float) -> str:
     return f"{(current / baseline - 1) * 100:+.1f}%"
 
 
+def assert_report_invariants(rows: list[dict], summaries: dict[str, dict]) -> None:
+    """Guard the frozen E2 narrative, separately from row/provenance validation."""
+    a, b, c = (summaries[arm] for arm in ARM_PROTOCOLS)
+    controller_rows = [
+        row for row in rows if row["arm"] == "B" and row.get("exit_reason") == "verified_patch"
+    ]
+    skipped_rows = [
+        row for row in rows if row["arm"] == "C"
+        and isinstance(row.get("review"), dict) and row["review"].get("skipped") is True
+    ]
+    if b["pass_rate"] < max(a["pass_rate"], c["pass_rate"]) or b["total_tokens"] >= a["total_tokens"]:
+        raise ValueError("E2 narrative no longer supports B as the best observed rate with fewer tokens")
+    if c["pass_rate"] >= b["pass_rate"] or c["total_tokens"] <= b["total_tokens"]:
+        raise ValueError("E2 narrative no longer supports the C versus B conclusion")
+    if any(row.get("case") != "pydantic__pydantic-8977" for row in controller_rows):
+        raise ValueError("E2 controller triggers are no longer limited to Pydantic")
+    if any(row.get("tests_pass") for row in skipped_rows):
+        raise ValueError("E2 skipped reviews no longer all fail hidden tests")
+    if any(item["regressions"] for item in summaries.values()):
+        raise ValueError("E2 pass-to-pass regression count is no longer zero")
+
+
 def markdown_report(rows: list[dict], metadata: dict) -> str:
     summaries = summarize(rows)
+    assert_report_invariants(rows, summaries)
+    a, b, c = (summaries[arm] for arm in ARM_PROTOCOLS)
+    cases = sorted({str(row.get("case")) for row in rows})
+    b_gain = (b["pass_rate"] - a["pass_rate"]) * 100
+    c_loss = (b["pass_rate"] - c["pass_rate"]) * 100
+    c_token_extra = (c["total_tokens"] / b["total_tokens"] - 1) * 100
     lines = [
         "# E2：确定性终止与单轮 Reviewer/Reviser 实验",
         "",
-        "> 结论先行：在 4 个真实仓库任务、每组 12 次 provider-default 重复运行中，",
+        f"> 结论先行：在 {len(cases)} 个真实仓库任务、每组 {b['runs']} 次 provider-default 重复运行中，",
         "> B 组以更少 token 得到最高的观察通过率，但样本很小且确定性终止触发的",
-        "> 3 条运行只有 1 条通过隐藏测试；C 组没有显示出优于 B 的收益。",
+        f"> {b['controller_triggers']} 条运行只有 {b['controller_passes']} 条通过隐藏测试；C 组没有显示出优于 B 的收益。",
         "",
         "## 冻结协议",
         "",
@@ -203,9 +268,9 @@ def markdown_report(rows: list[dict], metadata: dict) -> str:
 
     lines.extend([
         "",
-        "这是诊断性小样本，不支持显著性或因果结论。B 相比 A 的观察通过率高 16.7 个百分点，",
+        f"这是诊断性小样本，不支持显著性或因果结论。B 相比 A 的观察通过率高 {b_gain:.1f} 个百分点，",
         f"token 变化 {_delta_percent(summaries['B']['total_tokens'], summaries['A']['total_tokens'])}；"
-        "C 相比 B 的观察通过率低 8.3 个百分点，",
+        f"C 相比 B 的观察通过率低 {c_loss:.1f} 个百分点，",
         f"token 变化 {_delta_percent(summaries['C']['total_tokens'], summaries['B']['total_tokens'])}。",
         "",
         "## 逐任务结果",
@@ -213,7 +278,6 @@ def markdown_report(rows: list[dict], metadata: dict) -> str:
         "| Case | A pass / tokens | B pass / tokens | C pass / tokens |",
         "|---|---:|---:|---:|",
     ])
-    cases = sorted({str(row.get("case")) for row in rows})
     for case in cases:
         values = []
         for arm in ARM_PROTOCOLS:
@@ -224,18 +288,16 @@ def markdown_report(rows: list[dict], metadata: dict) -> str:
             )
         lines.append(f"| `{case}` | " + " | ".join(values) + " |")
 
-    b = summaries["B"]
-    c = summaries["C"]
     lines.extend([
         "",
         "## 机制分解",
         "",
         "### B：确定性终止",
         "",
-        f"- `verified_patch` 只触发 {b['controller_triggers']}/12 次，且都发生在 Pydantic；",
+        f"- `verified_patch` 只触发 {b['controller_triggers']}/{b['runs']} 次，且都发生在 Pydantic；",
         f"  其中 hidden pass 为 {b['controller_passes']}/{b['controller_triggers']}。",
         "- 控制器证明的是“最新补丁之后某个可见 pytest 命令退出码为 0”，不是完整任务正确。",
-        "  两条隐藏测试失败说明终止证据仍可能过窄，不能把 `verified_patch` 命名理解为",
+        f"  {b['controller_triggers'] - b['controller_passes']} 条隐藏测试失败说明终止证据仍可能过窄，不能把 `verified_patch` 命名理解为",
         "  evaluator 已验证的补丁。",
         "- B 的总 token 明显低于 A，但由于三组不是共享随机种子的配对实验，不能把全部",
         "  token 差异或通过率差异都归因于控制器。",
@@ -247,7 +309,7 @@ def markdown_report(rows: list[dict], metadata: dict) -> str:
         f"- Reviewer 给出负面结论 {c['review_negative']} 次，触发 Reviser {c['revision_attempts']} 次；",
         f"  修订后 hidden pass 为 {c['revision_passes']}/{c['revision_attempts']}。",
         f"- 另有 {c['review_skipped']} 次因 Coder 没有候选补丁而跳过审查，均失败。",
-        "- C 没有超过 B，并额外消耗约 39% token；因此当前证据不支持默认开启",
+        f"- C 没有超过 B，并额外消耗约 {c_token_extra:.0f}% token；因此当前证据不支持默认开启",
         "  Reviewer/Reviser。它更适合作为可选的补丁后检查机制，下一步应保证",
         "  Reviser 失败时可回退到候选补丁，并分别测量 Reviewer 诊断精度与 Reviser 修复收益。",
         "",
