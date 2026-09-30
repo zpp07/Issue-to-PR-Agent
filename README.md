@@ -6,14 +6,18 @@
 人工审批且可追溯的候选补丁**。项目重点不是堆叠 Agent 角色，而是验证长链路系统中更难的
 问题：补丁是否真的正确、Agent 为什么失败、执行权限如何收敛，以及一次修复花费了多少资源。
 
-> 当前定位：求职作品级研究原型，不是无人监管的生产机器人。系统默认不会推送代码或创建
-> GitHub PR；外部写操作必须经过明确审批。
+> 当前定位：求职作品级研究原型，不是无人监管的生产机器人。本地 UI 服务默认不会推送代码或创建
+> GitHub PR；只有显式真实发布模式、两道内容审批和最后一次外部写入确认全部满足后，才会创建 Draft PR。
 
 **本地界面已可用**：浏览器中可查看任务列表、提交 Issue、审批计划、跟踪逐步执行事件、
-审阅完整 diff，并冻结 Draft PR 请求及审批发布。默认流程停在 `ready_to_publish`，
-界面没有真实 GitHub 发布入口；显式模拟模式会标注“模拟发布”。
-启动方法见[打开本地界面](#打开本地界面)。**界面截图待人工补充**；这里不使用示意图冒充
-真实运行截图。
+审阅完整 diff，并冻结 Draft PR 请求及审批发布。默认流程停在 `ready_to_publish`；
+显式模拟模式只记录模拟结果，显式真实发布模式可在最终确认后创建 GitHub Draft PR。
+启动方法见[打开本地界面](#打开本地界面)。下图是项目作者提供的真实界面截图。
+
+![作者提供的真实本地界面截图：新建任务的 GitHub Issue 输入模式，左侧显示已有任务](docs/images/local-ui-new-task.png)
+
+截图由项目作者在本机提供，展示的是**新建任务的 GitHub Issue 模式**和左侧已有任务；
+它不是一次完整执行或真实 PR 创建的证明。
 
 ## 30 秒看懂项目
 
@@ -76,18 +80,48 @@ python service_http.py --open
 镜像，以及本地模型配置。构建镜像和配置模型的方法见下一节；自检只判断密钥环境变量是否
 存在或项目 `.env` 文件是否存在，不读取或显示密钥，也不验证密钥有效性。
 
-界面默认只到 `ready_to_publish`，没有真实 GitHub 发布按钮。可用
+界面默认只到 `ready_to_publish`，发布端点也保持关闭。可用
 `python service_http.py --open --fake-publisher` 显式启用**模拟发布**；这不会创建 PR。
+只有准备好 `GITHUB_TOKEN`、Git 身份与目标仓库写权限后，才使用
+`python service_http.py --open --real-publisher`。真实模式会显示最终确认对话框，并在确认后
+commit、push 工作分支及创建 Draft PR。两个发布模式互斥。
 本地服务仅监听 `127.0.0.1`，没有用户认证，不应暴露到公网。详细界面契约见
 [`docs/WEB_UI_W4.md`](docs/WEB_UI_W4.md)。
 
 ## 运行一次隔离修复
 
+### 当前模型与切换
+
+本地界面和 `IssueToPRService` 的 Planner、Coder、Reviewer 默认使用
+**DeepSeek V4.1 Flash**，官方 API 名称为 `deepseek-flash`，接口地址仍为
+`https://api.deepseek.com`。[官方更新说明](https://api-docs.deepseek.com/updates/)
+模型选择优先级为：显式 `model` 参数 > `AGENT_MODEL` 配置 > 产品默认值。
+旧配置若仍写着 `deepseek-chat`，会覆盖新默认值；仅升级代码不会替你修改本地配置。
+
+在 PowerShell 中停止旧服务，然后在项目根目录重启即可显式切换（不需要显示或重填密钥）：
+
+```powershell
+$env:AGENT_MODEL = 'deepseek-flash'
+python service_http.py --open --fake-publisher
+```
+
+`--fake-publisher` 只模拟发布，不模拟模型；创建计划和执行仍消耗付费模型 token。
+保持模型默认的思考模式；SDK 和标准库后备客户端都会将 `reasoning_content` 保留在
+模型对话历史中，不写入浏览器事件或审计 trace。
+[官方工具调用要求](https://api-docs.deepseek.com/guides/thinking_mode/)
+新版模型是否提高本项目任务成功率**尚未做付费对照验证**，不能用升级名称代替实测。
+
+历史 benchmark/教学脚本的显式旧模型名、冻结协议和历史报告不随产品默认值重写。
+新实验必须显式指定 `--model deepseek-flash`，与旧实验分开统计；不要混算成功率。
+`Usage.cost_rmb()` 仍是输入 2 / 输出 8 元每百万 token 的保守估算，与当前 Flash 高峰、
+未命中缓存单价一致，未计缓存/空闲时段折扣，**不是实际扣费账单**。
+[官方价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
+
 启动 Docker Desktop，并在本地 `.env` 中配置模型后：
 
 ```powershell
 docker build -t issue-to-pr-runner:phase3 -f docker\Dockerfile .
-python -m benchmark.run --cases case01_add --methods single
+python -m benchmark.run --cases case01_add --methods single --model deepseek-flash --output .local/deepseek-flash-smoke.jsonl
 ```
 
 运行真实模型任务前，在本地 `.env` 中填写 `DEEPSEEK_API_KEY`；该文件已被 Git 忽略。
@@ -272,16 +306,19 @@ commit、push 和调用 GitHub API，并强制 `draft=true`。
 
 发布前若 diff 改变或出现未跟踪文件，操作会被拒绝；没有 `GITHUB_TOKEN` 时会在任何 Git
 写操作之前失败。相同分支重试会查找并复用已有 Draft PR。详细状态机、端点和最小权限见
-[`docs/GITHUB_DRAFT_PR.md`](docs/GITHUB_DRAFT_PR.md)。代码路径已有离线 fake-publisher
-回归测试，但尚未替用户创建真实 PR；真实外部发布仍需单独明确确认。
+[`docs/GITHUB_DRAFT_PR.md`](docs/GITHUB_DRAFT_PR.md)。代码路径已有离线 publisher
+回归测试，并提供显式 `--real-publisher` 界面入口；本仓库仍未把离线测试冒充真实 smoke，
+README 末尾的真实 GitHub Draft PR 检查项只有在确实拿到 GitHub URL 后才能勾选。
 
 ## 产品化契约与演示文档
 
+- [第一次使用本地界面：用户指南](docs/USER_GUIDE.md)
 - [W2 执行事件与轮询契约](docs/EXECUTION_EVENTS_W2.md)
 - [W3 只读任务与 artifact API](docs/READ_ONLY_API_W3.md)
 - [W4 本地界面与模拟发布契约](docs/WEB_UI_W4.md)
 - [W5 启动自检与一键打开契约](docs/STARTUP_W5.md)
 - [W5/W6 验收环境与离线全链路证据](docs/PRODUCTIZATION_W6_VERIFICATION.md)
+- [2026-09-30 上传前核验：真实发布入口、模型迁移与离线回归](docs/PRE_PUSH_VERIFICATION_2026-09-30.md)
 - [基于界面的演示脚本](docs/DEMO.md)
 
 ## 文件结构

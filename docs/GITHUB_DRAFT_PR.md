@@ -28,7 +28,9 @@ GitHub Issue
 
 ## 本地 API 路线
 
-FastAPI 和无依赖 `service_http.py` 都提供相同主路径：
+以下是标准库 `service_http.py` 的本地 UI 路线。可选 FastAPI 提供相同业务路径，
+但不提供 UI 的 CLI 发布模式开关或二次确认字段校验；不要将它当作 UI 启动方式，
+也不要暴露到公网。
 
 1. `POST /tasks/github`：读取公开 GitHub Issue 并生成本地计划；
 2. `POST /tasks/{id}/approvals/plan`：审批计划；
@@ -36,7 +38,8 @@ FastAPI 和无依赖 `service_http.py` 都提供相同主路径：
 4. `POST /tasks/{id}/approvals/diff`：审批 diff/test 组合；
 5. `POST /tasks/{id}/draft-pr`：冻结 Draft PR 请求并返回 `request_sha256`；
 6. `POST /tasks/{id}/approvals/publish`：单独审批这个发布请求；
-7. `POST /tasks/{id}/draft-pr/publish`：执行真实 commit、push 和 Draft PR 创建。
+7. 以 `python service_http.py --open --real-publisher` 显式启用真实发布；默认及模拟模式均拒绝真实发布。
+8. `POST /tasks/{id}/draft-pr/publish`：携带最新 `subject_hash` 和最终确认字段，执行真实 commit、push 和 Draft PR 创建。
 
 准备请求示例：
 
@@ -64,6 +67,18 @@ Contents: write 与 Pull requests: write 的 fine-grained token。
 - Git 用户名/邮箱已经在本机配置；
 - base/head branch 与冻结请求一致；
 - 当前请求的 `request_sha256` 已由用户明确批准。
+- 服务由用户显式以 `--real-publisher` 启动，并在浏览器最终确认对话框中再次核对目标。
 
 离线测试使用 fake publisher 验证审批和漂移保护，不会联网或创建 PR。真实 GitHub smoke
 仍应由项目作者单独确认后执行。
+
+## 并发与浏览器来源保护
+
+同一个服务进程、同一个工作流实例中，每个任务的发布操作有独立非阻塞锁。
+重复请求在进入 publisher 前被拒绝；失败释放锁，仍需用户明确重试；成功后状态不再
+允许再次发布。这不是跨进程分布式锁，不能同时运行多个发布服务操作同一个数据库。
+界面发布请求进行中禁用确认框与提交按钮；这只是体验防重，服务端锁才是写入防重门。
+
+标准库真实发布端点同时检查本地 Host、浏览器同源 Origin（有此头时）、
+`Sec-Fetch-Site` 和 JSON Content-Type，拒绝跨站点表单及跨来源请求。
+无 Origin 的本机 JSON API 请求仍可使用；这些检查不是认证，服务仍只适合本机单用户。
