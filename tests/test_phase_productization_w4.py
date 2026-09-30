@@ -75,12 +75,17 @@ def test_ui_config_and_fake_publish_need_explicit_mode(monkeypatch):
     get = SimpleNamespace(path="/ui-config", _reply=lambda status, body: (status, body))
 
     monkeypatch.setattr(service_http, "FAKE_PUBLISHER_MODE", False)
-    assert service_http.Handler.do_GET(get) == (200, {"fake_publisher": False})
+    monkeypatch.setattr(service_http, "REAL_PUBLISHER_MODE", False)
+    assert service_http.Handler.do_GET(get) == (200, {
+        "fake_publisher": False, "real_publisher": False,
+    })
     service_http.Handler.do_POST(post)
     assert replies[-1][0] == 404 and workflow.calls == 0
 
     monkeypatch.setattr(service_http, "FAKE_PUBLISHER_MODE", True)
-    assert service_http.Handler.do_GET(get) == (200, {"fake_publisher": True})
+    assert service_http.Handler.do_GET(get) == (200, {
+        "fake_publisher": True, "real_publisher": False,
+    })
     service_http.Handler.do_POST(post)
     assert replies[-1][0] == 200
     assert replies[-1][1]["simulated"] is True
@@ -92,10 +97,52 @@ def test_ui_config_and_fake_publish_need_explicit_mode(monkeypatch):
     assert replies[-1][0] == 403 and workflow.calls == 1
 
 
-def test_frontend_only_calls_fake_publish_and_polls_after_202():
+def test_real_publish_route_needs_explicit_mode_and_confirmation(monkeypatch):
+    calls = []
+
+    class RecordingWorkflow:
+        def publish_draft_pr(self, task_id, subject_hash, publisher):
+            calls.append((task_id, subject_hash, publisher))
+            return {
+                "repository": "example/repo", "draft": True, "number": 12,
+                "html_url": "https://github.com/example/repo/pull/12",
+            }
+
+    replies = []
+    body = {"subject_hash": "approved-request-hash", "confirmation": "create-draft-pr"}
+    post = SimpleNamespace(
+        path="/tasks/task-1/draft-pr/publish", _body=lambda: body,
+        headers={"Host": "127.0.0.1:8765", "Content-Type": "application/json"},
+        _reply=lambda status, payload: replies.append((status, payload)),
+    )
+    monkeypatch.setattr(service_http, "workflow", RecordingWorkflow())
+    monkeypatch.setattr(service_http, "FAKE_PUBLISHER_MODE", False)
+    monkeypatch.setattr(service_http, "REAL_PUBLISHER_MODE", False)
+
+    service_http.Handler.do_POST(post)
+    assert replies[-1][0] == 403 and calls == []
+
+    monkeypatch.setattr(service_http, "REAL_PUBLISHER_MODE", True)
+    body.pop("confirmation")
+    service_http.Handler.do_POST(post)
+    assert replies[-1][0] == 409 and calls == []
+
+    sentinel = object()
+    body["confirmation"] = "create-draft-pr"
+    monkeypatch.setattr(service_http.GitHubAPI, "from_env", lambda: "api")
+    monkeypatch.setattr(service_http, "GitHubDraftPRPublisher", lambda api: sentinel)
+    service_http.Handler.do_POST(post)
+    assert replies[-1][0] == 200
+    assert calls == [("task-1", "approved-request-hash", sentinel)]
+
+
+def test_frontend_publish_modes_and_polling_contract():
     script = (Path(service_http.WEB_DIR) / "app.js").read_text(encoding="utf-8")
-    assert "/draft-pr/publish" not in script
+    assert "/draft-pr/publish" in script
     assert "/draft-pr/simulate" in script
+    assert 'confirmation: "create-draft-pr"' in script
+    assert "state.realPublisher" in script
+    assert "real-publish-confirm" in script
     assert "response.status !== 202" in script
     assert script.count("startPolling(taskId)") == 2  # Definition and the execute-success call.
     assert "innerHTML" not in script  # Issue, trace and diff are rendered as text nodes.

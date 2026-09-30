@@ -16,12 +16,14 @@ const ACTION_LABELS = {
   write_file: "写入文件", replace_text: "修改文本", run_command: "运行命令",
   finish: "Coder 结束", review_finish: "Reviewer 结束", plan_finish: "规划结束",
   progress_decision: "进度判断", no_progress_intervention: "无进展干预",
-  controller_finish: "控制器终止", llm_error: "模型调用错误", agent_exit: "Agent 轮次结束",
+  controller_finish: "控制器终止", candidate_patch_missing: "未生成补丁",
+  llm_error: "模型调用错误", agent_exit: "Agent 轮次结束",
 };
 
 const state = {
   tasks: [], task: null, events: [], eventSequences: new Set(), metadata: new Set(),
   artifacts: {}, tab: "plan", createMode: "local", fakePublisher: false,
+  realPublisher: false, publishRequest: null, publishing: false,
   pollTimer: null, pollToken: 0, pollCursor: 0, loadingGeneration: 0,
   diffPage: 0, seenDiffPages: new Set(), fullDiffShown: false,
 };
@@ -406,8 +408,23 @@ function diffClass(line) {
   if (line.startsWith("-")) return "deleted";
   return "context";
 }
+function hasReviewableDiff(artifact) {
+  return !!artifact && typeof artifact.content === "string"
+    && artifact.content.trim().length > 0 && artifact.size_bytes > 0;
+}
 function diffLines() { return state.artifacts.diff?.content.split(/\r?\n/) || []; }
 function renderDiffPage() {
+  if (!hasReviewableDiff(state.artifacts.diff)) {
+    $("diff-lines").replaceChildren();
+    text($("diff-page-label"), "0 / 0");
+    text($("diff-size"), "0 行 · 0 字节");
+    $("diff-prev").disabled = true;
+    $("diff-next").disabled = true;
+    $("diff-full-button").disabled = true;
+    updateDiffButtons();
+    return;
+  }
+  $("diff-full-button").disabled = false;
   const lines = diffLines();
   const pages = Math.max(1, Math.ceil(lines.length / PAGE_LINES));
   state.diffPage = Math.min(Math.max(state.diffPage, 0), pages - 1);
@@ -432,13 +449,16 @@ function addEvidence(title, value) {
 }
 function renderDiff() {
   const artifact = state.artifacts.diff;
-  $("diff-empty").hidden = !!artifact;
+  const hasPatch = hasReviewableDiff(artifact);
+  $("diff-empty").hidden = hasPatch;
   $("diff-content").hidden = !artifact;
   if (!artifact) {
+    text($("diff-empty"), "执行完成后，这里会显示完整补丁。");
     text($("diff-state"), "暂无补丁");
     return;
   }
-  text($("diff-state"), statusLabel(state.task.status));
+  if (!hasPatch) text($("diff-empty"), "本次执行没有生成可审批的代码改动；原有测试通过也不代表 Issue 已修复。请勿批准。 ");
+  text($("diff-state"), hasPatch ? statusLabel(state.task.status) : "无可审批改动");
   text($("diff-content-hash"), artifact.content_sha256 || "无");
   text($("diff-approval-hash"), artifact.approval_subject_sha256 || "无（审查已过期）");
   const evidence = $("review-evidence");
@@ -464,18 +484,22 @@ function renderDiff() {
 }
 function updateDiffButtons() {
   const artifact = state.artifacts.diff;
-  const canApprove = !!artifact && state.task?.status === "awaiting_diff_approval"
-    && !!artifact.approval_subject_sha256 && state.fullDiffShown;
+  const hasPatch = hasReviewableDiff(artifact);
+  const canDecide = !!artifact && state.task?.status === "awaiting_diff_approval"
+    && !!artifact.approval_subject_sha256;
+  const canApprove = canDecide && hasPatch && state.fullDiffShown;
   $("approve-diff-button").disabled = !canApprove;
-  $("reject-diff-button").disabled = !canApprove;
-  text($("diff-gate-hint"), !artifact?.approval_subject_sha256
+  $("reject-diff-button").disabled = !(canDecide && (!hasPatch || state.fullDiffShown));
+  text($("diff-gate-hint"), artifact && !hasPatch
+    ? "没有可审批的代码改动。旧版任务可拒绝此空补丁；新任务会直接标为验证失败。"
+    : !artifact?.approval_subject_sha256
     ? "没有当前有效的 diff_review 审批对象，不能审批。"
     : !state.fullDiffShown ? "请查看全部分页，或打开“查看完整 diff”，然后才能审批。"
       : state.task?.status !== "awaiting_diff_approval" ? "当前任务状态不允许审批 diff。" : "完整 diff 已展示，可以审批当前 diff/test 组合。 ");
 }
 function showFullDiff() {
   const artifact = state.artifacts.diff;
-  if (!artifact) return;
+  if (!hasReviewableDiff(artifact)) return;
   text($("full-diff-text"), artifact.content);
   $("full-diff-dialog").showModal();
   state.fullDiffShown = true;
@@ -483,7 +507,9 @@ function showFullDiff() {
 }
 async function decideDiff(decision) {
   const artifact = state.artifacts.diff;
-  if (!state.fullDiffShown || !artifact?.approval_subject_sha256 || state.task?.status !== "awaiting_diff_approval") return;
+  const hasPatch = hasReviewableDiff(artifact);
+  if (!artifact?.approval_subject_sha256 || state.task?.status !== "awaiting_diff_approval"
+      || (hasPatch && !state.fullDiffShown) || (decision === "approved" && !hasPatch)) return;
   try {
     await api("POST", `/tasks/${state.task.id}/approvals/diff`, {
       subject_hash: artifact.approval_subject_sha256, actor: "local-ui", decision,
@@ -509,6 +535,7 @@ function renderDraft() {
   if (canFreeze && !$("draft-head").value) $("draft-head").value = `agent/issue-${task.id.slice(0, 8)}`;
   if (canFreeze && !$("draft-title-input").value) $("draft-title-input").value = (task.issue.split(/\r?\n/).find((line) => line.trim()) || "Fix issue").trim().slice(0, 256);
   const artifact = state.artifacts.draft_pr_request;
+  state.publishRequest = null;
   $("draft-preview").hidden = !artifact;
   if (artifact) {
     $("draft-request-fields").replaceChildren();
@@ -516,6 +543,7 @@ function renderDraft() {
     try {
       const request = JSON.parse(artifact.content);
       requestValid = request && typeof request === "object" && request.draft === true;
+      if (requestValid) state.publishRequest = request;
       for (const [key, value] of Object.entries(request)) addRequestField(key, value);
     } catch (_) { addRequestField("error", "请求内容无法解析，不能审批。"); }
     text($("publish-hash"), `发布审批对象 SHA-256：${artifact.approval_subject_sha256 || "无"}`);
@@ -525,12 +553,32 @@ function renderDraft() {
   }
   $("ready-panel").hidden = task.status !== "ready_to_publish";
   $("simulate-button").hidden = !state.fakePublisher;
-  const simulated = state.fakePublisher && task.status === "draft_pr_created" && (() => {
-    try { return JSON.parse(state.artifacts.draft_pr?.content || "null")?.simulated === true; }
-    catch (_) { return false; }
-  })();
+  $("real-publish-button").hidden = !state.realPublisher;
+  text($("publisher-mode-detail"), state.fakePublisher
+    ? "模拟模式：下一步只记录模拟结果，不会 commit、push 或创建 GitHub PR。"
+    : state.realPublisher
+      ? "真实发布模式：下一步会再次要求确认，然后 commit、push 并创建 GitHub Draft PR。"
+      : "发布器未启用。请用 --fake-publisher 或 --real-publisher 重启服务。 ");
+  let publication = null;
+  try { publication = JSON.parse(state.artifacts.draft_pr?.content || "null"); }
+  catch (_) { publication = null; }
+  const simulated = task.status === "draft_pr_created" && publication?.simulated === true;
   $("simulated-panel").hidden = !simulated;
   if (simulated) text($("simulated-detail"), "已记录模拟 Draft PR。没有 Git commit、push 或 GitHub PR。 ");
+  const published = task.status === "draft_pr_created" && publication?.draft === true
+    && publication?.simulated !== true;
+  $("published-panel").hidden = !published;
+  if (published) {
+    text($("published-detail"), `已创建 ${publication.repository || "GitHub"} #${publication.number || "?"}，工作分支 ${publication.head || "未知"}。`);
+    const link = $("published-link");
+    let safeUrl = null;
+    try {
+      const parsed = new URL(publication.html_url);
+      if (parsed.protocol === "https:" && parsed.hostname === "github.com") safeUrl = parsed.href;
+    } catch (_) { /* Invalid publisher URL is shown as text only. */ }
+    link.hidden = !safeUrl;
+    link.href = safeUrl || "#";
+  }
 }
 async function freezeRequest(event) {
   event.preventDefault();
@@ -559,7 +607,7 @@ async function decidePublish(decision) {
     await api("POST", `/tasks/${state.task.id}/approvals/publish`, {subject_hash: subject, actor: "local-ui", decision});
     await refreshList();
     await openTask(state.task.id, "draft");
-    notice(decision === "approved" ? "发布请求已批准，流程停在 ready_to_publish；不会自动创建真实 PR。" : "发布请求已拒绝。 ");
+    notice(decision === "approved" ? "发布请求已批准。请核对当前发布模式并完成最后确认。" : "发布请求已拒绝。 ");
   } catch (error) { report(error); }
 }
 async function simulateDraft() {
@@ -575,6 +623,46 @@ async function simulateDraft() {
     notice("模拟发布已记录。没有提交、推送或创建 GitHub PR。 ");
   } catch (error) { report(error); }
   finally { setBusy(button, false, "模拟发布 Draft PR"); }
+}
+function showRealPublishConfirmation() {
+  const subject = state.artifacts.draft_pr_request?.approval_subject_sha256;
+  const request = state.publishRequest;
+  if (state.publishing || !state.realPublisher || !subject || !request || state.task?.status !== "ready_to_publish") return;
+  text($("confirm-repository"), request.repository);
+  text($("confirm-base"), request.base_branch);
+  text($("confirm-head"), request.head_branch);
+  text($("confirm-publish-hash"), subject);
+  $("real-publish-confirm").checked = false;
+  $("confirm-real-publish").disabled = true;
+  $("real-publish-dialog").showModal();
+}
+async function publishDraft() {
+  const subject = state.artifacts.draft_pr_request?.approval_subject_sha256;
+  if (state.publishing || !state.realPublisher || !subject || !$("real-publish-confirm").checked
+      || state.task?.status !== "ready_to_publish") return;
+  state.publishing = true;
+  const button = $("confirm-real-publish");
+  $("real-publish-confirm").disabled = true;
+  $("cancel-real-publish").disabled = true;
+  setBusy(button, true, "确认并创建 Draft PR");
+  try {
+    const {body} = await api("POST", `/tasks/${state.task.id}/draft-pr/publish`, {
+      subject_hash: subject, confirmation: "create-draft-pr",
+    });
+    if (body.draft !== true || body.simulated === true)
+      throw new Error("服务未返回真实 draft=true 结果，不能显示发布成功。 ");
+    $("real-publish-dialog").close();
+    await refreshList();
+    await openTask(state.task.id, "draft");
+    notice("GitHub Draft PR 已创建。请在 GitHub 继续审查，不要把 Draft 状态当作已合并。 ");
+  } catch (error) { report(error); }
+  finally {
+    state.publishing = false;
+    $("real-publish-confirm").disabled = false;
+    $("cancel-real-publish").disabled = false;
+    setBusy(button, false, "确认并创建 Draft PR");
+    button.disabled = !$("real-publish-confirm").checked;
+  }
 }
 
 function wireEvents() {
@@ -598,12 +686,22 @@ function wireEvents() {
   $("approve-publish-button").addEventListener("click", () => decidePublish("approved"));
   $("reject-publish-button").addEventListener("click", () => decidePublish("rejected"));
   $("simulate-button").addEventListener("click", simulateDraft);
+  $("real-publish-button").addEventListener("click", showRealPublishConfirmation);
+  $("cancel-real-publish").addEventListener("click", () => $("real-publish-dialog").close());
+  $("real-publish-confirm").addEventListener("change", () => {
+    $("confirm-real-publish").disabled = state.publishing || !$("real-publish-confirm").checked;
+  });
+  $("real-publish-dialog").addEventListener("cancel", (event) => {
+    if (state.publishing) event.preventDefault();
+  });
+  $("confirm-real-publish").addEventListener("click", publishDraft);
 }
 async function initialize() {
   wireEvents();
   try {
     const {body: config} = await api("GET", "/ui-config");
     state.fakePublisher = config.fake_publisher === true;
+    state.realPublisher = config.real_publisher === true;
     await refreshList();
     let requested = null;
     try { requested = new URLSearchParams(location.hash.slice(1)).get("task"); } catch (_) { /* Ignore malformed hash. */ }

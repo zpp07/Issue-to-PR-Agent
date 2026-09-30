@@ -26,9 +26,10 @@ class Usage:
     def cost_rmb(self, prompt_price=None, completion_price=None):
         """按每百万 token 价格（元）估算费用。
 
-        默认用 DeepSeek V3（deepseek-chat）官方价：
-        输入 2 元 / 百万 token（命中缓存 0.5，这里按未命中保守估计），
-        输出 8 元 / 百万 token。价格可能变动，以官网为准。
+        默认仍按输入 2 / 输出 8 元每百万 token 保守估算，保持历史账本
+        和预算计算不变。这也对应 2026-09-30 DeepSeek Flash 的高峰时段、
+        输入未命中缓存价格；未按缓存命中或空闲时段折扣计算，不是实际账单。
+        换用其他模型时应显式传入单价，价格可能变动，以官网为准。
         """
         prompt_price = prompt_price if prompt_price is not None else 2.0
         completion_price = completion_price if completion_price is not None else 8.0

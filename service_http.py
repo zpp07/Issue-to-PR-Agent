@@ -39,6 +39,7 @@ STATIC_FILES = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
 }
 FAKE_PUBLISHER_MODE = False
+REAL_PUBLISHER_MODE = False
 configured_data_dir = os.environ.get("AGENT_DATA_DIR")
 DATA_DIR = Path(configured_data_dir).resolve() if configured_data_dir else (ROOT / ".local").resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,11 +50,26 @@ workflow = IssueToPRWorkflow(store, DATA_DIR / "workspaces")
 def service():
     sandbox = DockerSandbox(image=os.environ.get("AGENT_SANDBOX_IMAGE", "issue-to-pr-runner:phase3"))
     return IssueToPRService(
-        workflow, make_client(), os.environ.get("AGENT_MODEL", "deepseek-chat"), sandbox=sandbox,
+        workflow, make_client(), sandbox=sandbox,
     )
 
 
 execution_manager = ExecutionManager(store, service)
+
+
+def _publish_request_error(headers, port: int = 8765) -> str | None:
+    """Reject browser cross-origin/form requests before any external writes."""
+    host = headers.get("Host", "").lower()
+    if host not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+        return "真实发布只接受本地工作台 Host"
+    origin = headers.get("Origin")
+    if origin is not None and origin != f"http://{host}":
+        return "真实发布拒绝跨来源请求"
+    if headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+        return "真实发布拒绝跨站点请求"
+    if headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+        return "真实发布只接受 application/json"
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -93,7 +109,10 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path in STATIC_FILES:
                 return self._static(parsed.path)
             if parsed.path == "/ui-config":
-                return self._reply(200, {"fake_publisher": FAKE_PUBLISHER_MODE})
+                return self._reply(200, {
+                    "fake_publisher": FAKE_PUBLISHER_MODE,
+                    "real_publisher": REAL_PUBLISHER_MODE,
+                })
             if parts == ["tasks"]:
                 query = parse_qs(parsed.query, keep_blank_values=True)
                 limit = int(query.get("limit", ["50"])[0])
@@ -162,8 +181,14 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._reply(200, store.task(parts[1]))
             if len(parts) == 4 and parts[0] == "tasks" and parts[2:] == ["draft-pr", "publish"]:
-                if FAKE_PUBLISHER_MODE:
-                    return self._reply(403, {"detail": "模拟模式禁止真实发布"})
+                if not REAL_PUBLISHER_MODE:
+                    return self._reply(403, {"detail": "真实发布未启用；请用 --real-publisher 重启服务"})
+                port = getattr(getattr(self, "server", None), "server_address", ("127.0.0.1", 8765))[1]
+                request_error = _publish_request_error(self.headers, port)
+                if request_error:
+                    return self._reply(403, {"detail": request_error})
+                if body.get("confirmation") != "create-draft-pr":
+                    return self._reply(409, {"detail": "缺少真实发布二次确认"})
                 result = workflow.publish_draft_pr(
                     parts[1], body["subject_hash"],
                     GitHubDraftPRPublisher(GitHubAPI.from_env()),
@@ -203,13 +228,17 @@ def _open_browser(url: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global FAKE_PUBLISHER_MODE
+    global FAKE_PUBLISHER_MODE, REAL_PUBLISHER_MODE
     parser = argparse.ArgumentParser(description="Local Issue-to-PR API and UI")
     parser.add_argument("--open", action="store_true", help="Start the service and open the local UI in a browser")
-    parser.add_argument("--fake-publisher", action="store_true",
-                        help="Enable a no-network simulated Draft PR publication button")
+    publisher = parser.add_mutually_exclusive_group()
+    publisher.add_argument("--fake-publisher", action="store_true",
+                           help="Enable a no-network simulated Draft PR publication button")
+    publisher.add_argument("--real-publisher", action="store_true",
+                           help="Enable the real commit, push and GitHub Draft PR button")
     args = parser.parse_args(argv)
     FAKE_PUBLISHER_MODE = args.fake_publisher
+    REAL_PUBLISHER_MODE = args.real_publisher
     print_startup_checks(startup_checks(ROOT))
     url = "http://127.0.0.1:8765/"
     try:
@@ -226,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Issue-to-PR local UI: {url}", flush=True)
         if FAKE_PUBLISHER_MODE:
             print("Fake publisher enabled: simulation only; real publish API disabled", flush=True)
+        elif REAL_PUBLISHER_MODE:
+            print("Real publisher enabled: the UI can commit, push and create a GitHub Draft PR", flush=True)
+        else:
+            print("Publisher disabled: use --fake-publisher or --real-publisher explicitly", flush=True)
         if args.open:
             try:
                 threading.Thread(target=_open_browser, args=(url,), daemon=True).start()

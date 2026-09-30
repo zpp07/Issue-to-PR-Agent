@@ -82,7 +82,7 @@ app = FastAPI(title="Local Issue-to-PR Agent", version="0.6.0")
 def service() -> IssueToPRService:
     sandbox = DockerSandbox(image=os.environ.get("AGENT_SANDBOX_IMAGE", "issue-to-pr-runner:phase3"))
     return IssueToPRService(
-        workflow, make_client(), os.environ.get("AGENT_MODEL", "deepseek-chat"), sandbox=sandbox,
+        workflow, make_client(), sandbox=sandbox,
     )
 
 

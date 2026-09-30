@@ -129,9 +129,20 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .request-field.wide{grid-column:1/-1}
 .request-field small{display:block;color:var(--muted);margin-bottom:.25rem}
 .request-field div,.request-field pre{margin:0;overflow-wrap:anywhere}
-.ready-panel,.simulated-panel{border:1px solid #567d75;background:#12332f;border-radius:10px;padding:1rem;margin-top:1rem}
-.ready-panel p,.simulated-panel p{margin:.35rem 0 .9rem;color:#c4e0d7}
+.ready-panel,.simulated-panel,.published-panel{border:1px solid #567d75;background:#12332f;border-radius:10px;padding:1rem;margin-top:1rem}
+.ready-panel p,.simulated-panel p,.published-panel p{margin:.35rem 0 .9rem;color:#c4e0d7}
 .simulated-badge{display:inline-block;border-radius:999px;background:#e4bb5d;color:#252114;padding:.26rem .7rem;font-weight:800;font-size:.8rem}
+.published-badge{display:inline-block;border-radius:999px;background:var(--accent);color:#073126;padding:.26rem .7rem;font-weight:800;font-size:.8rem}
+.publish-dialog{width:min(94vw,720px);padding:1.2rem;background:#0c1928;color:inherit;border:1px solid #9a5865;border-radius:12px;box-shadow:0 30px 100px #000a}
+.publish-dialog::backdrop{background:#02070cba}
+.danger-copy{color:#ffc4c5;background:#3a242d;border:1px solid #8d4d58;border-radius:9px;padding:.8rem}
+.publish-confirmation{display:grid;gap:.55rem;margin:1rem 0}
+.publish-confirmation div{display:grid;grid-template-columns:110px minmax(0,1fr);gap:.7rem;border-bottom:1px solid var(--border);padding:.45rem 0}
+.publish-confirmation dt{color:var(--muted)}
+.publish-confirmation dd{margin:0;overflow-wrap:anywhere}
+.confirmation-check{display:flex;align-items:flex-start;gap:.65rem;color:#e9f2f5}
+.confirmation-check input{width:auto;min-height:auto;margin-top:.3rem}
+.dialog-actions{display:flex;justify-content:flex-end;margin-top:1.2rem}
 .full-diff-dialog{width:min(96vw,1350px);height:min(94vh,960px);max-width:none;max-height:none;padding:1rem;background:#0c1928;color:inherit;border:1px solid #5a8c8a;border-radius:12px;box-shadow:0 30px 100px #000a;overflow:hidden}
 .full-diff-dialog::backdrop{background:#02070cba}
 .dialog-heading{border-bottom:1px solid var(--border);padding-bottom:.7rem}

@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
-from core.client import make_client
+from core.client import make_client, resolve_model
 from core.agent import run_agent
 from core.usage import Usage
 from core.tools import build_tool_registry, make_executor
@@ -25,20 +25,17 @@ REVIEWERS = build_tool_registry("read_file", "review_finish")
 SEARCH_CODERS = build_tool_registry("search_code", "read_file", "write_file", "run_command", "finish")
 SEARCH_REVIEWERS = build_tool_registry("search_code", "read_file", "review_finish")
 
-CODER_PROMPT = """你是一个程序员，负责修复代码中的 bug。
-工作流程：先用 read_file 读代码定位问题，用 write_file 修改，用 run_command 跑测试验证。
-
-重要约定：
-- 测试文件 test_buggy.py 就在目标文件同一目录，调用 run_command 时传入
-  argv，例如 ["python", "-m", "pytest", "-q"]；不能传 shell 字符串。
-  不要浪费时间去找 tests/ 子目录或其他路径。
-- 以测试用例为准：让 pytest 全部通过，并满足测试里声明的异常行为（如空输入抛 ValueError）。
-- 跳过依赖下载/环境配置，专注改代码和跑测试。
-
-修好并验证通过后，立即调用 finish 工具，简要说明你改了哪里。"""
+CODER_PROMPT = """你是一个程序员，负责根据任务要求修改仓库中的代码。
+先定位相关实现和测试，再尽早做一个可验证的最小修改；不要把步数全部花在重复检索上。
+局部修改优先使用可用的 replace_text；只有确需覆盖完整文件时才用 write_file。
+不要假定测试文件与目标文件同目录，按仓库实际布局寻找。运行测试时传 argv
+（例如 ["python", "-m", "pytest", "-q"]），不能传 shell 字符串；被策略拒绝的
+命令不要反复尝试。不要为了让测试变绿而删改无关测试，也不要安装依赖。
+如果未产生实际补丁，不要声称任务已修复。修改并验证后调用 finish，说明变更。"""
 
 REVIEWER_PROMPT = """你是一个认真负责的代码审查员。
-用 read_file 读代码，仔细检查：bug 和逻辑错误、边界情况、健壮性、性能。
+对照原始任务检查候选修改是否真的解决问题，再检查逻辑、边界情况和回归风险。
+只看见原有测试通过或现有代码没有明显错误，不代表任务已经完成。
 只在确实有问题时才提出，不要为了挑刺而挑刺。
 最后调用 review_finish 工具：
 - 代码通过：passed=true, issues=[]
@@ -46,14 +43,16 @@ REVIEWER_PROMPT = """你是一个认真负责的代码审查员。
 
 
 def multi_agent_review(client, target_file, task="修复代码中的 bug",
-                       max_rounds=3, model="deepseek-chat",
+                       max_rounds=3, model=None,
                        usage=None, trace=None, verbose=True, executor=None,
                        workspace=None, coder_tools=None, reviewer_tools=None,
-                       on_event: Callable[[dict[str, Any]], None] | None = None):
+                       on_event: Callable[[dict[str, Any]], None] | None = None,
+                       has_candidate_patch: Callable[[], bool] | None = None):
     """Coder 修 → Reviewer 查 → 不通过喂回意见，最多 max_rounds 轮。
 
     返回 (passed, review_issues, rounds, usage)。
     """
+    model = resolve_model(model)
     if usage is None:
         usage = Usage()
     coder_task = task
@@ -61,6 +60,7 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
     # 避免它用 `cd` 逃出沙箱、污染工作区之外的文件。
     workdir = os.path.abspath(workspace) if workspace else os.path.dirname(os.path.abspath(target_file))
     target_display = os.path.relpath(os.path.abspath(target_file), workdir)
+    coder_task = f"目标文件：{target_display}\n\n原始任务：{task}"
     coder_tools = coder_tools or CODERS
     reviewer_tools = reviewer_tools or REVIEWERS
 
@@ -91,13 +91,23 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
         if verbose:
             print(f"[Coder] 完成：{str(coder_result)[:80]}")
 
+        # In the Issue-to-PR workflow a Reviewer must never certify unchanged
+        # baseline code. The caller supplies the exact publishable-diff check;
+        # generic/non-Git users retain their previous behavior.
+        if has_candidate_patch is not None and not has_candidate_patch():
+            issue = "Coder 未生成可审查的代码补丁，跳过 Reviewer；原有测试通过不代表任务完成"
+            if on_event is not None:
+                on_event({"action": "candidate_patch_missing", "status": "error",
+                          "phase": "coder", "round": round_num})
+            return False, [issue], round_num, usage
+
         # Reviewer 审查（只读 + 结构化结论）
         if verbose:
             print("[Reviewer] 审查中...")
         review_executor = executor or make_executor(workdir)
         review, usage = run_agent(
             client, REVIEWER_PROMPT, reviewer_tools,
-            f"请审查文件 {target_display} 的代码",
+            f"原始任务：{task}\n\n请审查文件 {target_display} 的候选修改是否满足任务要求。",
             model=model, usage=usage, trace=trace,
             execute_tool=review_executor,
             on_event=phase_callback("reviewer", round_num),
@@ -120,6 +130,7 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
             print("[编排] 未通过，把意见喂回 Coder 继续改...")
         issue_text = "\n".join(f"- {i}" for i in issues)
         coder_task = (
+            f"目标文件：{target_display}\n\n原始任务：{task}\n\n"
             f"你上次的修改被审查员指出了以下问题：\n{issue_text}\n\n"
             f"请根据这些问题重新修改代码。"
         )

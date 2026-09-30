@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import threading
 from typing import Any
+import uuid
 
 from core.audit import TaskStore
 from core.github import GitHubAPI, GitHubDraftPRPublisher, validate_branch, validate_repository
@@ -48,6 +50,8 @@ class IssueToPRWorkflow:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.policy = CommandPolicy()
         self.memory = TaskMemory(store)
+        self._publish_registry_lock = threading.Lock()
+        self._publish_locks: dict[str, threading.Lock] = {}
 
     def create_task(self, repo_path: str | Path, issue: str) -> TaskContext:
         repo = Path(repo_path).resolve()
@@ -58,13 +62,23 @@ class IssueToPRWorkflow:
                 "请先提交/清理变更，或显式实现 working-tree snapshot 模式。"
             )
         base_commit = _git(repo, ["rev-parse", "HEAD"])
-        # Allocate id first so a worktree directory is never shared by tasks.
-        task_id = hashlib.sha256(f"{repo}|{issue}|{base_commit}".encode()).hexdigest()[:16]
-        workspace = self.workspace_root / task_id
-        if workspace.exists():
-            raise FileExistsError(f"任务工作区已存在：{workspace}")
-        subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", str(workspace), base_commit],
-                       check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        # A rejected/failed attempt must not prevent a new run of the same
+        # Issue against the same clean commit. Each task gets its own worktree.
+        workspace = self.workspace_root / uuid.uuid4().hex
+        while workspace.exists():
+            workspace = self.workspace_root / uuid.uuid4().hex
+        try:
+            # Git for Windows otherwise fails to check out long benchmark
+            # protocol filenames under the nested .local/workspaces path.
+            # Keep this scoped to the command; do not rewrite the user's Git config.
+            subprocess.run(["git", "-c", "core.longpaths=true", "-C", str(repo),
+                            "worktree", "add", "--detach", str(workspace), base_commit],
+                           check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        except subprocess.CalledProcessError as exc:
+            # The default exception hides Git's captured stderr, leaving the UI
+            # with only "exit status 128" and no actionable diagnosis.
+            detail = (exc.stderr or exc.stdout or "Git 未提供错误详情").strip()
+            raise RuntimeError(f"创建 Git worktree 失败：{detail}") from exc
         stored_id = self.store.create_task(issue, str(repo), str(workspace), base_commit)
         # Store uses a random opaque id; rename worktree to neither expose nor depend on it.
         self.store.event(stored_id, "worktree_ready", {"head": base_commit, "path": str(workspace)})
@@ -143,9 +157,14 @@ class IssueToPRWorkflow:
         self.store.artifact(task_id, "diff", diff, diff_hash)
         self.store.artifact(task_id, "test_report", test_report, test_hash)
         self.store.artifact(task_id, "review_report", json.dumps(reviewer_report, ensure_ascii=False), _digest(reviewer_report))
-        validation_passed = bool(reviewer_report.get("passed")) and reviewer_report.get("tests_exit_code") == 0
+        # Passing tests on the unchanged base are not evidence of an Issue fix.
+        # Keep the diff and test report for diagnosis, but never mint a review
+        # approval subject for an empty candidate patch.
+        validation_passed = (bool(diff) and bool(reviewer_report.get("passed"))
+                             and reviewer_report.get("tests_exit_code") == 0)
         if not validation_passed:
             failure = {
+                "reason": "empty_patch" if not diff else "review_or_tests_failed",
                 "reviewer_passed": bool(reviewer_report.get("passed")),
                 "tests_exit_code": reviewer_report.get("tests_exit_code"),
                 "test_report_sha256": test_hash,
@@ -154,7 +173,7 @@ class IssueToPRWorkflow:
             self.store.event(task_id, "validation_failed", failure)
             self.memory.capture_failure(
                 task_id,
-                f"独立验证失败：reviewer_passed={failure['reviewer_passed']}，"
+                f"独立验证失败：reason={failure['reason']}，reviewer_passed={failure['reviewer_passed']}，"
                 f"tests_exit_code={failure['tests_exit_code']}",
                 self.store.latest_artifact(task_id, "test_report"),
             )
@@ -175,11 +194,21 @@ class IssueToPRWorkflow:
         self.store.event(task_id, "validation_reconciled", {"reason": reason})
 
     def approve_diff(self, task_id: str, review_hash: str, actor: str, decision: str, reason: str | None = None) -> None:
-        if self.store.task(task_id)["status"] != "awaiting_diff_approval":
+        task = self.store.task(task_id)
+        if task["status"] != "awaiting_diff_approval":
             raise RuntimeError("任务不在 diff 审批状态")
         review = self.store.latest_artifact(task_id, "diff_review")
         if review["sha256"] != review_hash:
             raise ValueError("diff 审批对象已过期；请审批最新 diff/test 组合")
+        if decision == "approved":
+            diff = self.store.latest_artifact(task_id, "diff")
+            current_diff = _git(Path(task["workspace_path"]), [
+                "diff", "--no-ext-diff", "--binary", task["base_commit"],
+            ])
+            if not diff["content"] or not current_diff:
+                raise ValueError("没有可审批的代码改动；请拒绝本次空补丁")
+            if _digest(current_diff) != diff["sha256"]:
+                raise ValueError("当前 worktree diff 与待审批补丁不一致")
         approval = self.store.approve(task_id, "diff", review_hash, decision, actor, reason)
         self.store.set_status(task_id, "approved_for_pr" if decision == "approved" else "diff_rejected")
         self.memory.capture_approval(approval)
@@ -273,6 +302,20 @@ class IssueToPRWorkflow:
 
     def publish_draft_pr(self, task_id: str, request_hash: str, publisher=None) -> dict[str, Any]:
         """Commit, push and create a Draft PR after both approval gates."""
+        # One local service process shares this workflow instance. Keep the
+        # state/hash checks, external write and persisted result in the same
+        # per-task critical section; UI button disabling alone is not a lock.
+        with self._publish_registry_lock:
+            lock = self._publish_locks.setdefault(task_id, threading.Lock())
+        if not lock.acquire(blocking=False):
+            raise RuntimeError("任务正在发布，请勿重复提交")
+        try:
+            return self._publish_draft_pr(task_id, request_hash, publisher)
+        finally:
+            # A failed attempt leaves the existing retryable workflow state.
+            lock.release()
+
+    def _publish_draft_pr(self, task_id: str, request_hash: str, publisher=None) -> dict[str, Any]:
         task = self.store.task(task_id)
         if task["status"] != "ready_to_publish":
             raise RuntimeError("任务尚未获得发布审批")

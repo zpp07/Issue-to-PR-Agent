@@ -112,12 +112,29 @@ def test_one_command_open_and_fake_mode_use_local_url(monkeypatch, capsys):
     monkeypatch.setattr(service_http.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(service_http.webbrowser, "open", lambda url, new: opened.append((url, new)) or True)
     monkeypatch.setattr(service_http, "FAKE_PUBLISHER_MODE", False)
+    monkeypatch.setattr(service_http, "REAL_PUBLISHER_MODE", False)
 
     assert service_http.main(["--open", "--fake-publisher"]) == 0
     assert opened == [("http://127.0.0.1:8765/", 2)]
     assert server.served and server.closed
     assert service_http.FAKE_PUBLISHER_MODE is True
+    assert service_http.REAL_PUBLISHER_MODE is False
     assert "Issue-to-PR local UI: http://127.0.0.1:8765/" in capsys.readouterr().out
+
+
+def test_real_publisher_mode_is_explicit(monkeypatch, capsys):
+    server = SimpleNamespace(serve_forever=lambda: None, server_close=lambda: None)
+    monkeypatch.setattr(service_http, "startup_checks", lambda root: [])
+    monkeypatch.setattr(service_http, "print_startup_checks", lambda checks: None)
+    monkeypatch.setattr(service_http, "ThreadingHTTPServer", lambda *args: server)
+    monkeypatch.setattr(service_http.execution_manager, "recover_interrupted", lambda: None)
+    monkeypatch.setattr(service_http, "FAKE_PUBLISHER_MODE", False)
+    monkeypatch.setattr(service_http, "REAL_PUBLISHER_MODE", False)
+
+    assert service_http.main(["--real-publisher"]) == 0
+    assert service_http.FAKE_PUBLISHER_MODE is False
+    assert service_http.REAL_PUBLISHER_MODE is True
+    assert "Real publisher enabled" in capsys.readouterr().out
 
 
 def test_browser_thread_failure_keeps_server_running(monkeypatch, capsys):

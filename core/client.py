@@ -38,6 +38,19 @@ except ImportError:  # A dependency-free fallback keeps the local demo runnable.
 
 log = logging.getLogger("core.client")
 
+DEFAULT_MODEL = "deepseek-flash"
+
+
+def resolve_model(model=None):
+    """Explicit model > AGENT_MODEL > current product default; never read .env.
+
+    make_client may load configuration at runtime before this is called. An
+    explicit legacy model is left intact for historical benchmark protocols.
+    """
+    if model is not None:
+        return model
+    return os.environ.get("AGENT_MODEL", "").strip() or DEFAULT_MODEL
+
 
 class LLMCallError(RuntimeError):
     """LLM 调用失败的分类异常。
@@ -65,6 +78,11 @@ def _message_dict(message):
     if isinstance(message, dict):
         return message
     result = {"role": getattr(message, "role", "assistant"), "content": getattr(message, "content", None)}
+    # DeepSeek thinking-mode tool calls require the full reasoning field in
+    # subsequent requests. Keep it in model history, never in audit/UI events.
+    reasoning = getattr(message, "reasoning_content", None)
+    if reasoning is not None:
+        result["reasoning_content"] = reasoning
     calls = getattr(message, "tool_calls", None)
     if calls:
         result["tool_calls"] = [

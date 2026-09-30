@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from core.agent import run_agent
+from core.client import resolve_model
 from core.github import GitHubAPI
 from core.policy import CommandPolicy
 from core.search import build_code_search
@@ -15,7 +16,9 @@ from core.workflow import IssueToPRWorkflow, TaskContext
 from coder_reviewer import multi_agent_review
 
 PLANNER_TOOLS = build_tool_registry("search_code", "read_file", "plan_finish")
-SEARCH_CODER_TOOLS = build_tool_registry("search_code", "read_file", "write_file", "run_command", "finish")
+SEARCH_CODER_TOOLS = build_tool_registry(
+    "search_code", "read_file", "replace_text", "write_file", "run_command", "finish",
+)
 SEARCH_REVIEWER_TOOLS = build_tool_registry("search_code", "read_file", "review_finish")
 PLANNER_PROMPT = """你是 Python 项目的变更规划员。先阅读与 issue 相关的文件，
 优先使用 search_code 找到符号、调用方、测试和文档契约，再用 read_file 精读证据。
@@ -30,7 +33,8 @@ MAX_PROGRESS_EVENTS_PER_TASK = 2000
 _PUBLIC_ACTIONS = {
     "search_code", "read_file", "read_symbol", "write_file", "replace_text",
     "run_command", "finish", "review_finish", "plan_finish", "progress_decision",
-    "no_progress_intervention", "controller_finish", "llm_error", "text", "agent_exit",
+    "no_progress_intervention", "controller_finish", "candidate_patch_missing",
+    "llm_error", "text", "agent_exit",
 }
 _PUBLIC_STATUSES = {"ok", "error", "blocked", "rejected"}
 _PUBLIC_EXIT_REASONS = {
@@ -90,19 +94,42 @@ def _validate_plan(plan: Any) -> dict[str, Any]:
         raise ValueError("Planner 未返回结构化计划")
     required = {"goal", "affected_files", "steps", "risks", "allowed_commands"}
     if set(plan) != required:
-        raise ValueError("Planner 输出字段不完整")
+        raise ValueError("Planner 输出字段不符合计划协议")
+    if not isinstance(plan["goal"], str) or not plan["goal"].strip():
+        raise ValueError("Planner 目标必须是非空文本")
+    for field in ("affected_files", "steps", "risks"):
+        value = plan[field]
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValueError(f"Planner 的 {field} 必须是文本列表")
+    if not isinstance(plan["allowed_commands"], list):
+        raise ValueError("Planner 的 allowed_commands 必须是 argv 列表")
     policy = CommandPolicy()
     for argv in plan["allowed_commands"]:
+        if not isinstance(argv, list) or not argv or not all(
+            isinstance(part, str) and part for part in argv
+        ):
+            raise ValueError("Planner 的每条命令必须是非空 argv 字符串列表")
         if policy.evaluate(argv).level.value == "deny":
             raise ValueError(f"Planner 请求了被拒绝的命令：{argv!r}")
     return plan
 
 
+def _has_candidate_patch(workspace: Path, base_commit: str) -> bool:
+    """Check the tracked diff that record_execution and PR publication use."""
+    result = subprocess.run(
+        ["git", "-C", str(workspace), "diff", "--no-ext-diff", "--quiet", base_commit],
+        capture_output=True, check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError("无法检查任务工作区的候选补丁")
+    return result.returncode == 1
+
+
 class IssueToPRService:
-    def __init__(self, workflow: IssueToPRWorkflow, client, model: str = "deepseek-chat", sandbox=None):
+    def __init__(self, workflow: IssueToPRWorkflow, client, model: str | None = None, sandbox=None):
         self.workflow = workflow
         self.client = client
-        self.model = model
+        self.model = resolve_model(model)
         self.sandbox = sandbox
 
     def create_and_plan(self, repo_path: str | Path, issue: str) -> tuple[TaskContext, dict[str, Any], str]:
@@ -128,19 +155,47 @@ class IssueToPRService:
 
     def plan_existing(self, task_id: str) -> tuple[dict[str, Any], str]:
         task = self.workflow.store.task(task_id)
-        if task["status"] not in {"created", "plan_rejected"}:
+        if task["status"] not in {"created", "plan_rejected", "planning_failed"}:
             raise RuntimeError(f"任务状态 {task['status']} 不能重新生成计划")
+        planner_state: dict[str, Any] = {}
         result, _ = run_agent(
             self.client, PLANNER_PROMPT, PLANNER_TOOLS,
             self._task_with_memory(task_id, task["issue"]), model=self.model,
             execute_tool=make_executor(
                 task["workspace_path"], code_search=build_code_search(task["workspace_path"]),
-            ), max_steps=8,
+            ), max_steps=12,
+            final_step_prompt=(
+                "调查时间已结束。现在必须调用 plan_finish 提交五字段计划：goal、"
+                "affected_files、steps、risks、allowed_commands。证据不足时在 risks 中"
+                "说明不确定性，不要继续检索或编造。"
+            ),
+            final_step_tool_names={"plan_finish"}, terminal_tool_reserve=2,
+            run_state=planner_state,
         )
+        exit_reason = str(planner_state.get("exit_reason", "unknown"))
+        steps_used = planner_state.get("budget_state", {}).get("steps_used", 0)
+
+        def planning_failed(reason: str) -> None:
+            self.workflow.store.event(task_id, "planning_failed", {
+                "reason": reason, "exit_reason": exit_reason, "steps_used": steps_used,
+            })
+            self.workflow.store.set_status(task_id, "planning_failed")
+
         if isinstance(result, dict) and result.get("retryable"):
-            self.workflow.store.event(task_id, "planning_failed", {"error": result.get("result")})
+            planning_failed("llm_error")
             raise PlanningUnavailable(result["result"])
-        plan = _validate_plan(result)
+        try:
+            plan = _validate_plan(result)
+        except ValueError as exc:
+            planning_failed("invalid_plan" if exit_reason == "finish" else "agent_exit")
+            if exit_reason != "finish":
+                detail = (f"Planner 未提交 plan_finish（退出原因：{exit_reason}，"
+                          f"已用 {steps_used} 步）")
+            else:
+                detail = f"Planner 提交的计划无效：{exc}"
+            raise PlanningUnavailable(
+                f"{detail}。请重试现有任务，不要重新创建任务。"
+            ) from exc
         plan_hash = self.workflow.submit_plan(task_id, plan)
         return plan, plan_hash
 
@@ -161,6 +216,7 @@ class IssueToPRService:
             model=self.model, verbose=False, executor=executor, workspace=workspace,
             coder_tools=SEARCH_CODER_TOOLS, reviewer_tools=SEARCH_REVIEWER_TOOLS,
             on_event=self._execution_event_callback(task_id),
+            has_candidate_patch=lambda: _has_candidate_patch(workspace, task["base_commit"]),
         )
         # Prefer the conventional target-specific test.  It prevents unrelated
         # benchmark fixtures with duplicate names from poisoning independent

@@ -5,7 +5,7 @@
 1. 把 tool 执行从循环里抽出来，交给传入的 execute_tool / 或默认 core.tools.execute_tool
 2. 全程累计 token 用量（Usage）
 3. 结束信号统一为「终态工具」：finish / review_finish 或自由文本兜底
-4. 支持自定义 provider / model（默认 DeepSeek deepseek-chat）
+4. 支持自定义 provider / model（默认 DeepSeek V4.1 Flash / deepseek-flash）
 
 Phase 1 新增可靠性：
 5. LLM 调用异常分类（限流/超时/网络/鉴权/参数错误），不再无声崩掉
@@ -25,7 +25,7 @@ try:
 except ImportError:
     openai = None
 
-from core.client import LLMCallError
+from core.client import LLMCallError, resolve_model
 from core.usage import Usage
 from core.tools import execute_tool as default_execute_tool, normalize_tool_result
 
@@ -91,7 +91,7 @@ def run_agent(
     system_prompt,
     tools,
     task,
-    model="deepseek-chat",
+    model=None,
     max_steps=15,
     execute_tool=None,
     usage=None,
@@ -115,7 +115,7 @@ def run_agent(
         system_prompt 系统提示词
         tools        ToolRegistry（注册了该角色可用工具）
         task         用户任务
-        model        模型名
+        model        模型名；None 时使用 AGENT_MODEL 或 deepseek-flash
         max_steps    最大步数
         execute_tool 工具执行函数（默认 core.tools.execute_tool，可传入自定义）
         usage        Usage 实例（外部传入可跨 agent 累计）
@@ -128,6 +128,7 @@ def run_agent(
     返回：(final_result, usage)
         final_result：终态工具的参数 dict 或自由文本字符串
     """
+    model = resolve_model(model)
     if execute_tool is None:
         execute_tool = default_execute_tool
     if usage is None:
