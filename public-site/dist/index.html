@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="代码实践手记：记录个人编程学习、开源项目和工程实践。阅读 Issue-to-PR Agent 的设计、代码与案例。">
+  <meta name="robots" content="noindex,nofollow">
+  <title>代码实践手记 · ZP Code</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <a class="skip" href="#main">跳到正文</a>
+  <div class="preview-notice">本地预览版本 · 尚未开放公网，非在线 Agent 服务</div>
+  <header class="site-header wrap">
+    <a class="brand" href="/" aria-label="代码实践手记首页"><span class="brand-mark">zp<span>_</span></span><span class="brand-name">代码实践手记</span></a>
+    <nav aria-label="主导航"><a href="/#projects">项目</a><a href="/#notes">实践</a><a href="/#about">关于</a><a class="nav-source" href="https://github.com/zpp07/Issue-to-PR-Agent" rel="noreferrer">GitHub ↗</a></nav>
+  </header>
+  <div class="filing-banner wrap" aria-label="网站备案信息"><span>个人网站 · 代码实践手记</span><a href="https://beian.miit.gov.cn/" rel="noreferrer">赣ICP备2026027949号 <span aria-hidden="true">↗</span></a></div>
+  <main id="main">
+    <section class="hero wrap">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="small-dot"></span> PERSONAL DEVELOPMENT NOTES / 个人开发记录</p>
+        <h1>把想法写成代码，<br>把过程<span class="serif-accent">留下来。</span></h1>
+        <p class="hero-description">我是祝攀，正在学习 Agent 系统与后端工程。<br>这里记录一个代码修复项目的实现、评测与失败，也记录从本地代码走向云服务器的过程。</p>
+        <div class="actions"><a class="button primary" href="/project.html">阅读 Agent 项目 <span aria-hidden="true">↗</span></a><a class="text-link" href="/case.html">看一个具体案例 <span aria-hidden="true">→</span></a></div>
+        <p class="small-note">个人作品展示 · 代码与案例可阅读 · 不提供在线任务执行</p>
+      </div>
+      <aside class="code-window" aria-label="项目设计流程示意，不是运行日志">
+        <div class="window-title"><span class="window-dots" aria-hidden="true">● ● ●</span><span>issue-to-pr / workflow</span><span class="window-kind">设计示意</span></div>
+        <div class="code-content">
+          <p class="code-comment">// 修复不只是一段生成的代码</p>
+          <div class="flow-line"><span class="line-no">01</span><span class="code-key">read</span><span>Issue + repository</span></div>
+          <div class="flow-line"><span class="line-no">02</span><span class="code-key">plan</span><span>定位问题，形成计划</span></div>
+          <div class="flow-gate"><span class="line-no">↳</span><span class="gate-label">人工审批 · 计划哈希绑定</span></div>
+          <div class="flow-line"><span class="line-no">03</span><span class="code-key">patch</span><span>受约束的修改与测试</span></div>
+          <div class="flow-line"><span class="line-no">04</span><span class="code-key">review</span><span>diff + 测试报告</span></div>
+          <div class="flow-gate"><span class="line-no">↳</span><span class="gate-label">人工审批 · 发布请求冻结</span></div>
+          <div class="flow-line"><span class="line-no">05</span><span class="code-key">publish</span><span>显式启用后创建 Draft PR</span></div>
+        </div>
+        <div class="window-foot"><span class="small-dot"></span> 本地研究原型<span>Human in the loop</span></div>
+      </aside>
+    </section>
+    <div class="principles wrap" aria-label="记录原则"><span>先理解问题</span><span>再验证修改</span><span>最后保留证据</span><span class="principles-end">NOTES, NOT HYPE.</span></div>
+    <section id="projects" class="section wrap">
+      <div class="section-heading"><div><p class="eyebrow">01 / SELECTED PROJECT</p><h2>一个项目，持续拆解。</h2></div><p>从源码出发，说明实现，也说明边界。</p></div>
+      <article class="project-feature">
+        <div class="project-main"><div class="tags"><span>Python</span><span>Agent</span><span>开源实践</span></div><h3>Issue-to-PR Agent</h3><p>将 GitHub Issue 转换为经过测试、人工审批且可追溯的候选补丁。关注长链路中的失败、权限与证据，而不只是让模型“再试一次”。</p><a class="text-link" href="/project.html">查看设计与实现 <span aria-hidden="true">→</span></a></div>
+        <div class="project-details"><p class="detail-label">这次重点研究</p><dl><div><dt>执行边界</dt><dd>Docker 隔离与允许修改范围</dd></div><div><dt>人工监督</dt><dd>计划、diff 与发布分别审批</dd></div><div><dt>结果可追溯</dt><dd>事件记录、产物和 SHA-256</dd></div></dl><p class="small-note">当前是本地单用户研究原型，不是托管编程平台。</p></div>
+      </article>
+    </section>
+    <section id="notes" class="section wrap">
+      <div class="section-heading"><div><p class="eyebrow">02 / FIELD NOTES</p><h2>在具体问题里学习。</h2></div><a class="text-link" href="/project.html#evaluation">阅读评测记录 →</a></div>
+      <div class="notes-grid"><article class="note-card featured-note"><span class="note-number">NOTE / 001</span><h3><a href="/case.html">“尚未生成”<br>不等于“已经过期”。</a></h3><p>从一个历史修复方案出发，理解为什么需要区分产物不存在与产物失效。</p><div class="note-bottom"><span>前端状态 · 测试方案</span><a href="/case.html" aria-label="阅读审批状态案例">↗</a></div></article><article class="note-card"><span class="note-number">ENGINEERING / 后端实践</span><h3>从一次请求，<br>走到一次事务。</h3><p>学习 FastAPI、参数化 SQL、MySQL 提交与回滚，再把服务装进容器，通过 SSH 隧道在云服务器私下验证。</p><div class="note-bottom"><span>学习记录概述</span><span aria-hidden="true">↳</span></div></article><article class="note-card"><span class="note-number">METHOD / 记录方法</span><h3>把“做到了”<br>和“还没验证”分开。</h3><p>源码实现、离线测试、真实模型运行和云端验收，是不同层次的证据。记录失败，也保留尚未完成的部分。</p><div class="note-bottom"><span>个人工程笔记</span><span aria-hidden="true">↳</span></div></article></div>
+    </section>
+    <section id="opensource" class="section wrap"><div class="section-heading"><div><p class="eyebrow">03 / OPEN-SOURCE FIELDWORK</p><h2>从复现问题开始参与。</h2></div><p>Inspect AI · 问题报告，不是已合并 PR</p></div><div class="issue-list"><article><span class="note-number">ISSUE / 5556</span><h3>默认编码，也可能改变评测输入。</h3><p>定位 Windows cp936 环境下，Compose YAML 未显式使用 UTF-8 读取导致的中文值误解码；提供最小复现与源码位置。</p><a class="text-link" href="https://github.com/UKGovernmentBEIS/inspect_ai/issues/5556" rel="noreferrer">查看编码问题报告 ↗</a></article><article><span class="note-number">ISSUE / 5578</span><h3>同一个路径，不一定是同一个字符串。</h3><p>定位 FakeDocker 测试中斜杠与反斜杠比较导致的失败注入未触发；明确区分测试可移植性与真实 Docker 故障。</p><a class="text-link" href="https://github.com/UKGovernmentBEIS/inspect_ai/issues/5578" rel="noreferrer">查看测试问题报告 ↗</a></article><article><span class="note-number">ISSUE / 5580</span><h3>文件路径，还是 file URI？</h3><p>复现 Windows 盘符被识别为 URI scheme 后，目录查询结果返回裸路径的形式不一致问题，记录输入、输出与预期契约。</p><a class="text-link" href="https://github.com/UKGovernmentBEIS/inspect_ai/issues/5580" rel="noreferrer">查看路径问题报告 ↗</a></article></div><p class="small-note">这里只记录本人发布的问题报告；不将他人的修复补丁记作自己的代码贡献，也不推断当前维护者处理状态。</p></section>
+    <section id="about" class="about-section wrap"><p class="eyebrow">04 / ABOUT THIS SPACE</p><div class="about-grid"><h2>保持好奇，<br>也保持<span class="serif-accent">具体。</span></h2><div><p>我是祝攀，主要使用 Python，也在学习 C++。我独立主导 Issue-to-PR Agent，并借助 Codex、Claude 辅助开发；在实现之外，持续补充对设计取舍和核心代码的理解。</p><p>这个空间记录我怎样拆解问题、验证结果和参与开源。真正的 Agent 工作台保留在私有环境中，不接收网站访客的任务；后端学习实践也不包装成生产服务。</p><div class="actions"><a class="text-link" href="https://github.com/zpp07/Issue-to-PR-Agent" rel="noreferrer">前往项目源码 ↗</a><a class="text-link" href="/project.html#backend">阅读后端实践 →</a></div></div></div></section>
+  </main>
+  <footer class="site-footer wrap"><div><span class="footer-brand">ZP Code</span><span>代码实践手记 · 个人编程与项目记录</span></div><div><a href="/privacy.html">网站说明</a><span class="filing"><!-- filing:start -->本地预览 · ICP 备案尚未完成<!-- filing:end --></span></div></footer>
+</body>
+</html>

@@ -5,6 +5,11 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+# Public portfolio assets are hand-authored source, not a Python build output.
+!public-site/dist/
+!public-site/dist/**
+public-site/artifacts/
+public-site/release/
 .venv/
 venv/
 .local/
