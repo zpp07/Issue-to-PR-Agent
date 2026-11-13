@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import posixpath
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -76,24 +79,51 @@ def _paths(workspace: Path) -> list[str]:
     return sorted(set(result.stdout.decode("utf-8").split("\0")) - {""})
 
 
-def _manifest(workspace: Path, paths: list[str], snapshot: Path | None = None) -> str:
+def _link_target(workspace: Path, path: Path, relative: str) -> str:
+    target = os.readlink(path)
+    joined = posixpath.normpath(posixpath.join(posixpath.dirname(relative), target))
+    if (not target or "\\" in target or ":" in target or target.startswith("/")
+            or joined == ".." or joined.startswith("../")
+            or any(part.lower() == ".git" for part in target.split("/"))):
+        raise ValueError(f"公开验证拒绝指向工作区外或 Git 元数据的链接：{relative}")
+    try:
+        resolved = path.resolve().relative_to(workspace)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(f"公开验证无法安全解析链接：{relative}") from None
+    if any(part.lower() == ".git" for part in resolved.parts):
+        raise ValueError(f"公开验证拒绝指向 Git 元数据的链接：{relative}")
+    return target
+
+
+def _manifest(workspace: Path, paths: list[str], snapshot: Path | None = None) -> tuple[str, list[str]]:
     digest = hashlib.sha256()
+    present = []
     for relative in paths:
         path = workspace / relative
-        if path.is_symlink() or path.resolve() != path:
-            raise ValueError(f"公开验证暂不支持链接路径：{relative}")
-        if not path.exists():
+        if path.parent.resolve() != path.parent:
+            raise ValueError(f"公开验证拒绝通过链接目录读取文件：{relative}")
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
             continue
-        if not path.is_file():
+        present.append(relative)
+        if stat.S_ISLNK(mode):
+            target = _link_target(workspace, path, relative)
+            kind, data = b"link", os.fsencode(target)
+        elif stat.S_ISREG(mode):
+            kind, data = b"file", path.read_bytes()
+        else:
             raise ValueError(f"公开验证暂不支持非普通文件：{relative}")
-        data = path.read_bytes()
-        digest.update(relative.encode("utf-8") + b"\0" + hashlib.sha256(data).digest())
+        digest.update(relative.encode("utf-8") + b"\0" + kind + b"\0" + hashlib.sha256(data).digest())
         if snapshot is not None:
             dest = snapshot / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-            shutil.copymode(path, dest)
-    return digest.hexdigest()
+            if stat.S_ISLNK(mode):
+                dest.symlink_to(target, target_is_directory=path.is_dir())
+            else:
+                dest.write_bytes(data)
+                shutil.copymode(path, dest)
+    return digest.hexdigest(), present
 
 
 def verify_public(workspace: Path, test_paths: list[str], sandbox, *,
@@ -107,7 +137,11 @@ def verify_public(workspace: Path, test_paths: list[str], sandbox, *,
         snapshot = Path(directory).resolve()
         # The Docker runner's unprivileged UID needs to traverse this directory.
         snapshot.chmod(0o755)
-        before = _manifest(workspace, paths, snapshot)
+        before, present = _manifest(workspace, paths, snapshot)
+        if (before, present) != _manifest(snapshot, paths):
+            return 1, "公开验证快照与工作区清单不一致", {
+                "snapshot_sha256": before, "snapshot_unchanged": False,
+            }
         if base_commit and candidate(workspace, base_commit, snapshot=snapshot).tree != expected_tree:
             return 1, "公开验证快照与候选 Git tree 不一致", {
                 "snapshot_sha256": before, "snapshot_unchanged": False,
@@ -126,10 +160,13 @@ def verify_public(workspace: Path, test_paths: list[str], sandbox, *,
             image_id = None
         snapshot_paths = sorted(path.relative_to(snapshot).as_posix()
                                 for path in snapshot.rglob("*") if path.is_file() or path.is_symlink())
-        unchanged = (snapshot_paths == [path for path in paths if (workspace / path).is_file()]
-                     and before == _manifest(snapshot, paths)
-                     and paths == _paths(workspace)
-                     and before == _manifest(workspace, paths))
+        try:
+            unchanged = (snapshot_paths == present
+                         and (before, present) == _manifest(snapshot, paths)
+                         and paths == _paths(workspace)
+                         and (before, present) == _manifest(workspace, paths))
+        except (OSError, RuntimeError, ValueError):
+            unchanged = False
     matches = [line[len(marker):] for line in output.splitlines() if line.startswith(marker)]
     try:
         counts = json.loads(matches[0]) if len(matches) == 1 else {}

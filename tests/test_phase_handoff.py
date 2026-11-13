@@ -86,6 +86,49 @@ def test_timeout_removes_named_container(monkeypatch, tmp_path):
     assert result.timed_out and result.image_id == "sha256:local"
 
 
+@pytest.mark.parametrize("mode", ["preserve", "retarget", "escape"])
+def test_verify_public_directory_symlink(tmp_path, mode):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    git_run(workspace, ["init", "-q"])
+    git_run(workspace, ["config", "core.symlinks", "true"])
+    (workspace / ".agents" / "skills").mkdir(parents=True)
+    (workspace / ".agents" / "skills" / "example.txt").write_text("skill", encoding="utf-8")
+    (workspace / ".claude").mkdir()
+    link = workspace / ".claude" / "skills"
+    target = "../../outside" if mode == "escape" else "../.agents/skills"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        pytest.skip("Windows requires permission to create symbolic links")
+    git_run(workspace, ["add", "."])
+    git_run(workspace, ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "base"])
+    base = git_run(workspace, ["rev-parse", "HEAD"]).stdout.strip()
+    tree = candidate(workspace, base).tree
+
+    class Sandbox:
+        def run(self, snapshot, argv, **kwargs):
+            assert mode != "escape"
+            copied = snapshot / ".claude" / "skills"
+            assert copied.is_symlink()
+            assert copied.resolve() == snapshot / ".agents" / "skills"
+            assert (copied / "example.txt").read_text(encoding="utf-8") == "skill"
+            if mode == "retarget":
+                copied.unlink()
+                copied.symlink_to("..", target_is_directory=True)
+            return SandboxResult(0, argv[-1] + '{"cases":1,"collected":1,"passed":1,"failed":0}')
+
+    if mode == "escape":
+        with pytest.raises(ValueError, match="工作区外"):
+            verify_public(workspace, [], Sandbox(), base_commit=base, expected_tree=tree)
+    else:
+        code, _, evidence = verify_public(workspace, [], Sandbox(), base_commit=base, expected_tree=tree)
+        assert (code == 0) == evidence["snapshot_unchanged"] == (mode == "preserve")
+
+
 def _approved_task(tmp_path, files):
     repo = tmp_path / "source"
     repo.mkdir()
