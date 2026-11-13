@@ -125,12 +125,13 @@ def _has_candidate_patch(workspace: Path, base_commit: str) -> bool:
 
 class IssueToPRService:
     def __init__(self, workflow: IssueToPRWorkflow, client, model: str | None = None, sandbox=None,
-                 *, trusted_local: bool = False):
+                 *, trusted_local: bool = False, verification_profile=None):
         self.workflow = workflow
         self.client = client
         self.model = resolve_model(model)
         self.sandbox = sandbox
         self.trusted_local = trusted_local
+        self.verification_profile = verification_profile
 
     def _budget(self, task_id):
         usage = Usage()
@@ -224,14 +225,16 @@ class IssueToPRService:
     def execute_after_plan_approval(self, task_id: str, target_file: str, max_rounds: int = 3) -> dict[str, str]:
         if self.sandbox is None and not self.trusted_local:
             raise DockerUnavailable("执行仓库代码需要 Docker；可信本地执行须显式启用 trusted_local")
-        if self.sandbox is not None:
-            self.sandbox.require_available()
         task = self.workflow.store.task(task_id)
+        profile = self.verification_profile(task["repo_path"]) if self.verification_profile else None
+        sandbox = profile["sandbox"] if profile else self.sandbox
+        if sandbox is not None:
+            sandbox.require_available()
         workspace = Path(task["workspace_path"]).resolve()
         target = (workspace / target_file).resolve()
         if workspace not in target.parents or not target.is_file():
             raise ValueError("target_file 必须是任务工作区内的现有文件")
-        command_runner = self.sandbox.command_runner(workspace) if self.sandbox else None
+        command_runner = sandbox.command_runner(workspace) if sandbox else None
         code_search = build_code_search(workspace)
         executor = self.workflow.executor_for(
             task_id, workspace, command_runner=command_runner, code_search=code_search,
@@ -248,6 +251,12 @@ class IssueToPRService:
         conventional_test = workspace / "tests" / f"test_{target.stem}.py"
         target_test = sibling_test if sibling_test.is_file() else conventional_test
         test_paths = [target_test.relative_to(workspace).as_posix()] if target_test.is_file() else []
+        verification_options = {}
+        if profile:
+            test_paths = profile["test_paths"]
+            verification_options = {
+                "pythonpath": profile["pythonpath"], "load_conftest": profile["load_conftest"],
+            }
         tested = None
         approved_plan = self.workflow.store.latest_artifact(task_id, "plan")
         task_text = self._task_with_memory(task_id, task["issue"])
@@ -258,7 +267,8 @@ class IssueToPRService:
             nonlocal tested
             patch = candidate(workspace, task["base_commit"])
             code, output, evidence = verify_public(
-                workspace, test_paths, self.sandbox, base_commit=task["base_commit"], expected_tree=patch.tree,
+                workspace, test_paths, sandbox, base_commit=task["base_commit"], expected_tree=patch.tree,
+                **verification_options,
             )
             tested = (patch, code, output, evidence)
             self.workflow.store.event(task_id, "public_candidate_verified", {

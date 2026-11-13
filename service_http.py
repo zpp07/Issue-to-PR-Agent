@@ -54,9 +54,21 @@ def runner():
     return DockerSandbox(image=os.environ.get("AGENT_SANDBOX_IMAGE", "issue-to-pr-runner:phase3"))
 
 
+def verification_profile(repo_path):
+    configured_repo = os.environ.get("INSPECT_AI_VERIFY_REPO")
+    if not configured_repo or Path(repo_path).resolve() != Path(configured_repo).resolve():
+        return None
+    return {
+        "sandbox": DockerSandbox(image=os.environ["INSPECT_AI_VERIFY_IMAGE"]),
+        "test_paths": ["tests/dataset/test_dataset.py", "tests/util/test_json.py"],
+        "pythonpath": ("src", "tests"),
+        "load_conftest": False,
+    }
+
+
 def service():
     return IssueToPRService(
-        workflow, make_client(), sandbox=runner(),
+        workflow, make_client(), sandbox=runner(), verification_profile=verification_profile,
     )
 
 

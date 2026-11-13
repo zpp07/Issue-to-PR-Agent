@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory() as temp:
     collection = Path(temp) / "collection.json"
     env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     env.pop("PYTEST_ADDOPTS", None)
-    options = ["-o", "addopts=", "-o", "pythonpath=.", "-p", "no:cacheprovider", "-q"]
+    options = ["-o", "addopts=", "-p", "no:cacheprovider", "-q"] + PYTEST_OPTIONS
     collector = '''
 import json
 from pathlib import Path
@@ -150,11 +150,16 @@ def _manifest(workspace: Path, paths: list[str], gitlinks: dict[str, bytes],
 
 
 def verify_public(workspace: Path, test_paths: list[str], sandbox, *,
-                  base_commit: str | None = None, expected_tree: str | None = None) -> tuple[int, str, dict]:
+                  base_commit: str | None = None, expected_tree: str | None = None,
+                  pythonpath: tuple[str, ...] = (".",), load_conftest: bool = True) -> tuple[int, str, dict]:
     """Report counts detect ordinary empty/aborted runs, not malicious pytest."""
     marker = f"PUBLIC_JUNIT_{secrets.token_hex(12)}="
     python = "python" if sandbox else sys.executable
-    argv = [python, "-I", "-B", "-c", _HARNESS, marker, *test_paths]
+    options = ["-o", "pythonpath=" + " ".join(pythonpath)]
+    if not load_conftest:
+        options.append("--noconftest")
+    harness = f"PYTEST_OPTIONS = {options!r}\n" + _HARNESS
+    argv = [python, "-I", "-B", "-c", harness, marker, *test_paths]
     paths = _paths(workspace)
     gitlinks = _gitlinks(workspace)
     with TemporaryDirectory(prefix="issue-to-pr-verify-") as directory:
