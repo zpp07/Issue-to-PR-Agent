@@ -86,7 +86,7 @@ def test_timeout_removes_named_container(monkeypatch, tmp_path):
     assert result.timed_out and result.image_id == "sha256:local"
 
 
-@pytest.mark.parametrize("mode", ["preserve", "retarget", "escape"])
+@pytest.mark.parametrize("mode", ["preserve", "retarget", "escape", "populated_submodule"])
 def test_verify_public_directory_symlink(tmp_path, mode):
     workspace = tmp_path / "repo"
     workspace.mkdir()
@@ -105,13 +105,22 @@ def test_verify_public_directory_symlink(tmp_path, mode):
         pytest.skip("Windows requires permission to create symbolic links")
     git_run(workspace, ["add", "."])
     git_run(workspace, ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "initial"])
+    submodule_commit = git_run(workspace, ["rev-parse", "HEAD"]).stdout.strip()
+    git_run(workspace, ["update-index", "--add", "--cacheinfo", f"160000,{submodule_commit},vendor"])
+    (workspace / "vendor").mkdir()
+    git_run(workspace, ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                         "commit", "-qm", "base"])
     base = git_run(workspace, ["rev-parse", "HEAD"]).stdout.strip()
     tree = candidate(workspace, base).tree
+    if mode == "populated_submodule":
+        (workspace / "vendor" / ".git").write_text("gitdir: unavailable", encoding="utf-8")
 
     class Sandbox:
         def run(self, snapshot, argv, **kwargs):
-            assert mode != "escape"
+            assert mode in {"preserve", "retarget"}
+            assert (snapshot / "vendor").is_dir()
+            assert not list((snapshot / "vendor").iterdir())
             copied = snapshot / ".claude" / "skills"
             assert copied.is_symlink()
             assert copied.resolve() == snapshot / ".agents" / "skills"
@@ -123,6 +132,9 @@ def test_verify_public_directory_symlink(tmp_path, mode):
 
     if mode == "escape":
         with pytest.raises(ValueError, match="工作区外"):
+            verify_public(workspace, [], Sandbox(), base_commit=base, expected_tree=tree)
+    elif mode == "populated_submodule":
+        with pytest.raises(ValueError, match="空子模块"):
             verify_public(workspace, [], Sandbox(), base_commit=base, expected_tree=tree)
     else:
         code, _, evidence = verify_public(workspace, [], Sandbox(), base_commit=base, expected_tree=tree)

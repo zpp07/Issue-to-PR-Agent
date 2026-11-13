@@ -79,6 +79,22 @@ def _paths(workspace: Path) -> list[str]:
     return sorted(set(result.stdout.decode("utf-8").split("\0")) - {""})
 
 
+def _gitlinks(workspace: Path) -> dict[str, bytes]:
+    result = subprocess.run(
+        ["git", "-C", str(workspace), "ls-files", "--stage", "-z"],
+        capture_output=True, check=True, timeout=30,
+    )
+    links = {}
+    for entry in result.stdout.split(b"\0"):
+        if entry.startswith(b"160000 "):
+            metadata, relative = entry.split(b"\t", 1)
+            _, commit, stage = metadata.split()
+            if stage != b"0":
+                raise ValueError("公开验证拒绝存在冲突的 Git 子模块")
+            links[relative.decode("utf-8")] = commit
+    return links
+
+
 def _link_target(workspace: Path, path: Path, relative: str) -> str:
     target = os.readlink(path)
     joined = posixpath.normpath(posixpath.join(posixpath.dirname(relative), target))
@@ -95,7 +111,8 @@ def _link_target(workspace: Path, path: Path, relative: str) -> str:
     return target
 
 
-def _manifest(workspace: Path, paths: list[str], snapshot: Path | None = None) -> tuple[str, list[str]]:
+def _manifest(workspace: Path, paths: list[str], gitlinks: dict[str, bytes],
+              snapshot: Path | None = None) -> tuple[str, list[str]]:
     digest = hashlib.sha256()
     present = []
     for relative in paths:
@@ -107,7 +124,11 @@ def _manifest(workspace: Path, paths: list[str], snapshot: Path | None = None) -
         except FileNotFoundError:
             continue
         present.append(relative)
-        if stat.S_ISLNK(mode):
+        if relative in gitlinks:
+            if not stat.S_ISDIR(mode) or path.resolve() != path or any(path.iterdir()):
+                raise ValueError(f"公开验证仅支持未初始化的空子模块目录：{relative}")
+            kind, data = b"gitlink", gitlinks[relative]
+        elif stat.S_ISLNK(mode):
             target = _link_target(workspace, path, relative)
             kind, data = b"link", os.fsencode(target)
         elif stat.S_ISREG(mode):
@@ -118,7 +139,9 @@ def _manifest(workspace: Path, paths: list[str], snapshot: Path | None = None) -
         if snapshot is not None:
             dest = snapshot / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if stat.S_ISLNK(mode):
+            if kind == b"gitlink":
+                dest.mkdir()
+            elif kind == b"link":
                 dest.symlink_to(target, target_is_directory=path.is_dir())
             else:
                 dest.write_bytes(data)
@@ -133,12 +156,13 @@ def verify_public(workspace: Path, test_paths: list[str], sandbox, *,
     python = "python" if sandbox else sys.executable
     argv = [python, "-I", "-B", "-c", _HARNESS, marker, *test_paths]
     paths = _paths(workspace)
+    gitlinks = _gitlinks(workspace)
     with TemporaryDirectory(prefix="issue-to-pr-verify-") as directory:
         snapshot = Path(directory).resolve()
         # The Docker runner's unprivileged UID needs to traverse this directory.
         snapshot.chmod(0o755)
-        before, present = _manifest(workspace, paths, snapshot)
-        if (before, present) != _manifest(snapshot, paths):
+        before, present = _manifest(workspace, paths, gitlinks, snapshot)
+        if (before, present) != _manifest(snapshot, paths, gitlinks):
             return 1, "公开验证快照与工作区清单不一致", {
                 "snapshot_sha256": before, "snapshot_unchanged": False,
             }
@@ -158,13 +182,17 @@ def verify_public(workspace: Path, test_paths: list[str], sandbox, *,
             except subprocess.TimeoutExpired:
                 code, output = 124, "可信本地验证超时"
             image_id = None
-        snapshot_paths = sorted(path.relative_to(snapshot).as_posix()
-                                for path in snapshot.rglob("*") if path.is_file() or path.is_symlink())
+        snapshot_paths = sorted(
+            relative for path in snapshot.rglob("*")
+            if (relative := path.relative_to(snapshot).as_posix()) in gitlinks
+            or path.is_file() or path.is_symlink()
+        )
         try:
             unchanged = (snapshot_paths == present
-                         and (before, present) == _manifest(snapshot, paths)
+                         and (before, present) == _manifest(snapshot, paths, gitlinks)
                          and paths == _paths(workspace)
-                         and (before, present) == _manifest(workspace, paths))
+                         and gitlinks == _gitlinks(workspace)
+                         and (before, present) == _manifest(workspace, paths, gitlinks))
         except (OSError, RuntimeError, ValueError):
             unchanged = False
     matches = [line[len(marker):] for line in output.splitlines() if line.startswith(marker)]
