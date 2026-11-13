@@ -47,20 +47,14 @@ class CommandPolicy:
         if command in {"rm", "del", "rmdir", "curl", "wget", "powershell", "cmd", "bash", "sh"}:
             return CommandDecision(CommandLevel.DENY, "禁止危险 shell、删除或网络命令")
 
-        if command in {"pytest", "ruff"}:
-            return CommandDecision(CommandLevel.ALLOW, "允许的质量检查命令")
-
-        if command in {"python", "python.exe"}:
-            if len(argv) >= 3 and argv[1:3] == ["-m", "pytest"]:
-                return CommandDecision(CommandLevel.ALLOW, "允许通过 Python 运行 pytest")
-            if len(argv) >= 3 and argv[1:3] == ["-m", "ruff"]:
-                return CommandDecision(CommandLevel.ALLOW, "允许通过 Python 运行 ruff")
-            return CommandDecision(CommandLevel.DENY, "仅允许 python -m pytest 或 python -m ruff")
+        quality = tuple(argv[1:]) if command in {"python", "python.exe"} else ("-m", *argv)
+        if quality in {("-m", "pytest"), ("-m", "pytest", "-q"), ("-m", "ruff", "check", ".")}:
+            return CommandDecision(CommandLevel.ALLOW, "允许的固定质量检查命令")
 
         if command == "git":
             if len(argv) < 2:
                 return CommandDecision(CommandLevel.DENY, "git 子命令缺失")
-            if argv[1] in self.SAFE_GIT:
+            if argv[1] in self.SAFE_GIT and len(argv) == 2:
                 return CommandDecision(CommandLevel.ALLOW, "允许的只读 Git 命令")
             if argv[1] in self.HIGH_RISK_GIT:
                 return CommandDecision(CommandLevel.APPROVAL, "Git 状态变更需要人工审批")

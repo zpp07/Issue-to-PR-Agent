@@ -231,7 +231,7 @@ def test_service_persists_only_public_fields_during_fake_execution(tmpdir, monke
         }, "edit"),
         _tool_response("finish", {"result": "fixed"}, "finish"),
         _tool_response("review_finish", {"passed": True, "issues": []}, "review"),
-    ]))
+    ]), trusted_local=True)
     # Exercise the existing HTTP route logic with a fake client and isolated DB.
     monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path / "http-data"))
     import service_http

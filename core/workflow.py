@@ -4,18 +4,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import threading
 from typing import Any
 import uuid
+from weakref import WeakValueDictionary
 
 from core.audit import TaskStore
+from core.candidate import candidate, git_run, plan_paths
 from core.github import GitHubAPI, GitHubDraftPRPublisher, validate_branch, validate_repository
 from core.memory import TaskMemory
 from core.policy import CommandPolicy
-from core.tools import make_executor
+from core.tools import ToolResult, make_executor
 
 
 def _digest(value: str | dict[str, Any]) -> str:
@@ -25,9 +28,7 @@ def _digest(value: str | dict[str, Any]) -> str:
 
 
 def _git(repo: Path, argv: list[str]) -> str:
-    result = subprocess.run(["git", "-C", str(repo), *argv], capture_output=True, text=True,
-                            encoding="utf-8", errors="replace", check=True)
-    return result.stdout.strip()
+    return git_run(repo, argv).stdout.strip()
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,7 @@ class IssueToPRWorkflow:
         self.policy = CommandPolicy()
         self.memory = TaskMemory(store)
         self._publish_registry_lock = threading.Lock()
-        self._publish_locks: dict[str, threading.Lock] = {}
+        self._publish_locks = WeakValueDictionary()
 
     def create_task(self, repo_path: str | Path, issue: str) -> TaskContext:
         repo = Path(repo_path).resolve()
@@ -73,7 +74,8 @@ class IssueToPRWorkflow:
             # Keep this scoped to the command; do not rewrite the user's Git config.
             subprocess.run(["git", "-c", "core.longpaths=true", "-C", str(repo),
                             "worktree", "add", "--detach", str(workspace), base_commit],
-                           check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                            check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            timeout=30)
         except subprocess.CalledProcessError as exc:
             # The default exception hides Git's captured stderr, leaving the UI
             # with only "exit status 128" and no actionable diagnosis.
@@ -88,14 +90,23 @@ class IssueToPRWorkflow:
         required = {"goal", "affected_files", "steps", "risks", "allowed_commands"}
         if set(plan) != required or not isinstance(plan["allowed_commands"], list):
             raise ValueError(f"计划必须恰好包含 {sorted(required)}")
+        files = plan["affected_files"]
+        if not isinstance(files, list) or not all(isinstance(path, str) for path in files):
+            raise ValueError("计划的 affected_files 必须是文本列表")
+        task = self.store.task(task_id)
+        if task["status"] not in {"created", "plan_rejected", "planning_failed"}:
+            raise RuntimeError("任务不在可提交计划的状态")
+        plan_paths(Path(task["workspace_path"]), files)
         for argv in plan["allowed_commands"]:
             decision = self.policy.evaluate(argv)
             if decision.level.value == "deny":
                 raise ValueError(f"计划含被拒绝命令 {argv!r}：{decision.reason}")
         subject_hash = _digest(plan)
-        self.store.artifact(task_id, "plan", json.dumps(plan, ensure_ascii=False, indent=2), subject_hash)
-        self.store.set_status(task_id, "awaiting_plan_approval")
-        self.store.event(task_id, "plan_submitted", {"plan_sha256": subject_hash})
+        self.store.complete_operation(
+            task_id, task["status"], "awaiting_plan_approval",
+            artifacts=[("plan", json.dumps(plan, ensure_ascii=False, indent=2), subject_hash)],
+            event=("plan_submitted", {"plan_sha256": subject_hash}),
+        )
         return subject_hash
 
     def approve_plan(self, task_id: str, plan_hash: str, actor: str, decision: str, reason: str | None = None) -> None:
@@ -105,16 +116,16 @@ class IssueToPRWorkflow:
         plan = self.store.latest_artifact(task_id, "plan")
         if plan["sha256"] != plan_hash:
             raise ValueError("计划哈希不匹配；请审批当前版本")
-        approval = self.store.approve(task_id, "plan", plan_hash, decision, actor, reason)
         next_status = "ready_to_execute" if decision == "approved" else "plan_rejected"
-        if not self.store.transition_status(task_id, current_status, next_status):
-            raise RuntimeError("计划审批期间任务状态已变化")
+        approval = self.store.approve(task_id, "plan", plan_hash, decision, actor, reason,
+                                      transition=(current_status, next_status))
         self.memory.capture_approval(approval)
         if decision == "approved":
             self.memory.capture_approved_plan(task_id)
 
     def executor_for(self, task_id: str, workdir: str | Path | None = None,
-                     command_runner=None, code_search=None, writable_files=None):
+                     command_runner=None, code_search=None, writable_files=None,
+                     *, enforce_plan: bool = False):
         task = self.store.task(task_id)
         if task["status"] not in {"ready_to_execute", "executing"}:
             raise RuntimeError("任务尚未获得计划审批")
@@ -134,43 +145,72 @@ class IssueToPRWorkflow:
             })
             return self.store.is_approved(task_id, "command", command_hash)
 
-        return make_executor(
+        approved = json.loads(plan["content"])
+        if enforce_plan:
+            writable_files = [task_workspace / path
+                              for path in plan_paths(task_workspace, approved["affected_files"])]
+        execute = make_executor(
             execution_workdir, policy=self.policy,
             approval_callback=command_approval, command_runner=command_runner,
             code_search=code_search, writable_files=writable_files,
         )
+        if not enforce_plan:
+            return execute
+
+        def restricted(name, args):
+            if name == "run_command" and args.get("argv") not in approved["allowed_commands"]:
+                return ToolResult("命令被策略拒绝：argv 不在当前批准计划中；请重新审批", "rejected")
+            return execute(name, args)
+
+        return restricted
 
     def approve_command(self, task_id: str, argv: list[str], actor: str, decision: str, reason: str | None = None) -> str:
         subject_hash = _digest({"argv": argv})
         self.store.approve(task_id, "command", subject_hash, decision, actor, reason)
         return subject_hash
 
-    def record_execution(self, task_id: str, test_report: str, reviewer_report: dict[str, Any]) -> dict[str, str]:
+    def record_execution(self, task_id: str, test_report: str, reviewer_report: dict[str, Any],
+                         *, tested_diff: str | None = None, tested_tree: str | None = None) -> dict[str, str]:
         task = self.store.task(task_id)
         if task["status"] not in {"ready_to_execute", "executing"}:
             raise RuntimeError("任务不在可执行状态")
         workspace = Path(task["workspace_path"])
-        diff = _git(workspace, ["diff", "--no-ext-diff", "--binary", task["base_commit"]])
+        patch = candidate(workspace, task["base_commit"])
+        diff = patch.diff
+        plan = json.loads(self.store.latest_artifact(task_id, "plan")["content"])
+        allowed = plan_paths(workspace, plan["affected_files"])
+        outside = [path for path in patch.paths if os.path.normcase(path) not in allowed]
         diff_hash, test_hash = _digest(diff), _digest(test_report)
         report = {"base_commit": task["base_commit"], "diff_sha256": diff_hash,
-                  "test_report_sha256": test_hash, "reviewer": reviewer_report}
-        self.store.artifact(task_id, "diff", diff, diff_hash)
-        self.store.artifact(task_id, "test_report", test_report, test_hash)
-        self.store.artifact(task_id, "review_report", json.dumps(reviewer_report, ensure_ascii=False), _digest(reviewer_report))
+                  "candidate_tree": patch.tree, "test_report_sha256": test_hash, "reviewer": reviewer_report}
+        artifacts = [
+            ("diff", diff, diff_hash),
+            ("test_report", test_report, test_hash),
+            ("review_report", json.dumps(reviewer_report, ensure_ascii=False), _digest(reviewer_report)),
+        ]
         # Passing tests on the unchanged base are not evidence of an Issue fix.
         # Keep the diff and test report for diagnosis, but never mint a review
         # approval subject for an empty candidate patch.
-        validation_passed = (bool(diff) and bool(reviewer_report.get("passed"))
-                             and reviewer_report.get("tests_exit_code") == 0)
+        drifted = ((tested_diff is not None and tested_diff != diff_hash)
+                   or (tested_tree is not None and tested_tree != patch.tree))
+        validation_passed = (bool(diff) and not drifted and not outside
+                             and reviewer_report.get("passed") is True
+                             and type(reviewer_report.get("tests_exit_code")) is int
+                             and reviewer_report["tests_exit_code"] == 0)
         if not validation_passed:
             failure = {
-                "reason": "empty_patch" if not diff else "review_or_tests_failed",
+                "reason": ("candidate_changed" if drifted else
+                           "outside_approved_plan" if outside else
+                           "empty_patch" if not diff else "review_or_tests_failed"),
+                "outside_approved_plan": outside,
                 "reviewer_passed": bool(reviewer_report.get("passed")),
                 "tests_exit_code": reviewer_report.get("tests_exit_code"),
                 "test_report_sha256": test_hash,
             }
-            self.store.set_status(task_id, "validation_failed")
-            self.store.event(task_id, "validation_failed", failure)
+            self.store.complete_operation(
+                task_id, task["status"], "validation_failed",
+                artifacts=artifacts, event=("validation_failed", failure),
+            )
             self.memory.capture_failure(
                 task_id,
                 f"独立验证失败：reason={failure['reason']}，reviewer_passed={failure['reviewer_passed']}，"
@@ -180,9 +220,11 @@ class IssueToPRWorkflow:
             return {"diff_sha256": diff_hash, "test_report_sha256": test_hash,
                     "validation": "failed"}
         review_hash = _digest(report)
-        self.store.artifact(task_id, "diff_review", json.dumps(report, ensure_ascii=False, indent=2), review_hash)
-        self.store.set_status(task_id, "awaiting_diff_approval")
-        self.store.event(task_id, "diff_review_ready", {**report, "review_sha256": review_hash})
+        artifacts.append(("diff_review", json.dumps(report, ensure_ascii=False, indent=2), review_hash))
+        self.store.complete_operation(
+            task_id, task["status"], "awaiting_diff_approval", artifacts=artifacts,
+            event=("diff_review_ready", {**report, "review_sha256": review_hash}),
+        )
         return {"diff_sha256": diff_hash, "test_report_sha256": test_hash, "review_sha256": review_hash}
 
     def reconcile_failed_validation(self, task_id: str, reason: str) -> None:
@@ -202,15 +244,18 @@ class IssueToPRWorkflow:
             raise ValueError("diff 审批对象已过期；请审批最新 diff/test 组合")
         if decision == "approved":
             diff = self.store.latest_artifact(task_id, "diff")
-            current_diff = _git(Path(task["workspace_path"]), [
-                "diff", "--no-ext-diff", "--binary", task["base_commit"],
-            ])
+            patch = candidate(Path(task["workspace_path"]), task["base_commit"])
+            current_diff = patch.diff
             if not diff["content"] or not current_diff:
                 raise ValueError("没有可审批的代码改动；请拒绝本次空补丁")
             if _digest(current_diff) != diff["sha256"]:
                 raise ValueError("当前 worktree diff 与待审批补丁不一致")
-        approval = self.store.approve(task_id, "diff", review_hash, decision, actor, reason)
-        self.store.set_status(task_id, "approved_for_pr" if decision == "approved" else "diff_rejected")
+            reviewed_tree = json.loads(review["content"]).get("candidate_tree")
+            if reviewed_tree is not None and reviewed_tree != patch.tree:
+                raise ValueError("当前 worktree tree 与待审批补丁不一致")
+        status = "approved_for_pr" if decision == "approved" else "diff_rejected"
+        approval = self.store.approve(task_id, "diff", review_hash, decision, actor, reason,
+                                      transition=("awaiting_diff_approval", status))
         self.memory.capture_approval(approval)
 
     def prepare_draft_pr(
@@ -227,12 +272,11 @@ class IssueToPRWorkflow:
             raise RuntimeError("当前 diff/test 组合没有有效审批")
         review = json.loads(review_artifact["content"])
         diff_artifact = self.store.latest_artifact(task_id, "diff")
-        current_diff = _git(
-            Path(task["workspace_path"]),
-            ["diff", "--no-ext-diff", "--binary", task["base_commit"]],
-        )
+        patch = candidate(Path(task["workspace_path"]), task["base_commit"])
+        current_diff = patch.diff
         current_hash = _digest(current_diff)
-        if not current_diff or current_hash != diff_artifact["sha256"] or current_hash != review["diff_sha256"]:
+        if (not current_diff or current_hash != diff_artifact["sha256"] or current_hash != review["diff_sha256"]
+                or review.get("candidate_tree", patch.tree) != patch.tree):
             raise ValueError("当前 worktree diff 与已审批对象不一致")
 
         repository = validate_repository(repository)
@@ -274,18 +318,18 @@ class IssueToPRWorkflow:
             "base_commit": task["base_commit"],
             "diff_review_sha256": review_artifact["sha256"],
             "diff_sha256": current_hash,
+            "candidate_tree": patch.tree,
             "test_report_sha256": review["test_report_sha256"],
         }
         request_hash = _digest(request)
-        self.store.artifact(
-            task_id, "draft_pr_request",
-            json.dumps(request, ensure_ascii=False, indent=2, sort_keys=True), request_hash,
+        self.store.complete_operation(
+            task_id, task["status"], "awaiting_publish_approval",
+            artifacts=[("draft_pr_request", json.dumps(request, ensure_ascii=False, indent=2, sort_keys=True), request_hash)],
+            event=("draft_pr_request_ready", {
+                "request_sha256": request_hash, "repository": repository,
+                "base_branch": base_branch, "head_branch": head_branch, "draft": True,
+            }),
         )
-        self.store.set_status(task_id, "awaiting_publish_approval")
-        self.store.event(task_id, "draft_pr_request_ready", {
-            "request_sha256": request_hash, "repository": repository,
-            "base_branch": base_branch, "head_branch": head_branch, "draft": True,
-        })
         return {"request_sha256": request_hash, "request": request}
 
     def approve_publish(self, task_id: str, request_hash: str, actor: str,
@@ -296,8 +340,9 @@ class IssueToPRWorkflow:
         request = self.store.latest_artifact(task_id, "draft_pr_request")
         if request["sha256"] != request_hash:
             raise ValueError("发布审批对象已过期；请审批最新 Draft PR 请求")
-        approval = self.store.approve(task_id, "publish", request_hash, decision, actor, reason)
-        self.store.set_status(task_id, "ready_to_publish" if decision == "approved" else "publish_rejected")
+        status = "ready_to_publish" if decision == "approved" else "publish_rejected"
+        approval = self.store.approve(task_id, "publish", request_hash, decision, actor, reason,
+                                      transition=("awaiting_publish_approval", status))
         self.memory.capture_approval(approval)
 
     def publish_draft_pr(self, task_id: str, request_hash: str, publisher=None) -> dict[str, Any]:
@@ -327,15 +372,15 @@ class IssueToPRWorkflow:
         request = json.loads(artifact["content"])
         if request.get("draft") is not True:
             raise ValueError("只允许创建 Draft PR")
-        current_diff = _git(
-            Path(task["workspace_path"]),
-            ["diff", "--no-ext-diff", "--binary", task["base_commit"]],
-        )
-        if _digest(current_diff) != request["diff_sha256"]:
-            self.store.set_status(task_id, "ready_to_execute")
-            self.store.event(task_id, "draft_pr_request_invalidated", {
-                "request_sha256": request_hash, "reason": "diff_changed",
-            })
+        patch = candidate(Path(task["workspace_path"]), task["base_commit"])
+        if (_digest(patch.diff) != request["diff_sha256"]
+                or request.get("candidate_tree", patch.tree) != patch.tree):
+            self.store.complete_operation(
+                task_id, "ready_to_publish", "ready_to_execute", artifacts=[],
+                event=("draft_pr_request_invalidated", {
+                    "request_sha256": request_hash, "reason": "diff_changed",
+                }),
+            )
             raise ValueError("发布前 diff 已变化；请重新执行 diff 与发布审批")
 
         publisher = publisher or GitHubDraftPRPublisher(GitHubAPI.from_env())
@@ -359,16 +404,15 @@ class IssueToPRWorkflow:
             })
             raise RuntimeError("发布器没有返回匹配 repository 的 Draft PR")
         result_hash = _digest(result)
-        self.store.artifact(
-            task_id, "draft_pr", json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True),
-            result_hash,
+        self.store.complete_operation(
+            task_id, "ready_to_publish", "draft_pr_created",
+            artifacts=[("draft_pr", json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), result_hash)],
+            event=("draft_pr_created", {
+                "request_sha256": request_hash, "result_sha256": result_hash,
+                "repository": request["repository"], "number": result.get("number"),
+                "html_url": result.get("html_url"), "draft": True,
+            }),
         )
-        self.store.set_status(task_id, "draft_pr_created")
-        self.store.event(task_id, "draft_pr_created", {
-            "request_sha256": request_hash, "result_sha256": result_hash,
-            "repository": request["repository"], "number": result.get("number"),
-            "html_url": result.get("html_url"), "draft": True,
-        })
         return result
 
 

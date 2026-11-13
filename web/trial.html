@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Issue-to-PR Agent · 试用</title>
+  <link rel="stylesheet" href="/trial/style.css">
+  <script src="/trial/app.js" defer></script>
+</head>
+<body>
+  <main class="main-content trial-content">
+    <header class="view-heading">
+      <h1>试用 Issue-to-PR Agent</h1>
+      <p>使用你的 DeepSeek API Key 修复预设仓库里的加法缺陷，审批计划后查看并下载通过验证的补丁。</p>
+    </header>
+    <form id="trial-form" class="create-card" hidden>
+      <label for="preset">预设仓库</label>
+      <select id="preset"><option value="python-addition">Python 加法缺陷</option></select>
+      <label for="key">DeepSeek API Key</label>
+      <input id="key" type="password" autocomplete="off" required maxlength="256">
+      <p class="field-hint">两次提交都使用你填写的 Key，模型费用由你的账户承担。Key 随请求发送到试用服务和 DeepSeek。</p>
+      <button id="plan" type="submit" class="button button-primary">生成计划</button>
+      <section id="approval" class="stage-panel" hidden>
+        <h2>待审批计划</h2>
+        <pre id="plan-content" class="diff-lines"></pre>
+        <button id="execute" type="button" class="button button-primary">批准计划并执行</button>
+      </section>
+    </form>
+    <p id="status" class="notice" role="status" aria-live="polite" hidden></p>
+    <section id="result" class="stage-panel" hidden>
+      <h2>执行结果</h2>
+      <p id="evidence"></p>
+      <pre id="diff" class="diff-lines"></pre>
+      <button id="download" type="button" class="button button-primary" hidden>下载补丁</button>
+    </section>
+  </main>
+</body>
+</html>

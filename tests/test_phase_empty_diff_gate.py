@@ -198,6 +198,9 @@ def test_fake_client_execution_with_no_edit_never_requests_diff_approval(tmp_pat
         )
 
     class FakeSandbox:
+        def require_available(self):
+            pass
+
         def command_runner(self, workspace):
             def unexpected_command(*args, **kwargs):
                 raise AssertionError("No command expected from the Coder")

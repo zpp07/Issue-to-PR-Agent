@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sys
-from threading import Thread
+from threading import BoundedSemaphore, Thread
 import traceback
 from typing import Any, Callable
 
@@ -12,16 +12,23 @@ from core.audit import TaskStore
 class ExecutionManager:
     """Submit one approved execution at a time; never auto-replay interrupted edits."""
 
-    def __init__(self, store: TaskStore, service_factory: Callable[[], Any]):
+    def __init__(self, store: TaskStore, service_factory: Callable[[], Any], max_running: int = 2):
         self.store = store
         self.service_factory = service_factory
+        self._slots = BoundedSemaphore(max_running)
 
     def submit(self, task_id: str, target_file: str, max_rounds: int = 3) -> dict[str, Any]:
         if not isinstance(target_file, str) or not target_file.strip():
             raise ValueError("target_file 必须是非空文件路径")
         if type(max_rounds) is not int or not 1 <= max_rounds <= 3:
             raise ValueError("max_rounds 必须在 1–3 之间")
-        self.store.claim_execution(task_id)
+        if not self._slots.acquire(blocking=False):
+            raise RuntimeError("已达到并行执行上限，请稍后重试")
+        try:
+            self.store.claim_execution(task_id)
+        except BaseException:
+            self._slots.release()
+            raise
         worker = Thread(
             target=self._run, args=(task_id, target_file, max_rounds),
             name=f"issue-to-pr-{task_id[:8]}", daemon=True,
@@ -29,6 +36,7 @@ class ExecutionManager:
         try:
             worker.start()
         except Exception as exc:
+            self._slots.release()
             self._fail(task_id, exc)
             raise
         return {
@@ -51,11 +59,16 @@ class ExecutionManager:
             })
         except Exception as exc:
             self._fail(task_id, exc)
+        finally:
+            self._slots.release()
 
     def _fail(self, task_id: str, exc: Exception) -> None:
         traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
         if self.store.transition_status(task_id, "executing", "execution_failed"):
             self.store.event(task_id, "execution_failed", {"error_type": type(exc).__name__})
+        else:
+            self.store.event(task_id, "execution_error", {"error_type": type(exc).__name__,
+                                                          "status_unchanged": True})
 
     def recover_interrupted(self) -> list[str]:
         return self.store.recover_interrupted_executions()

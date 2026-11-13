@@ -28,15 +28,16 @@
         <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
 
         <section id="create-view" class="view" aria-labelledby="create-title">
-          <div class="view-heading"><p class="eyebrow">开始</p><h1 id="create-title">从 Issue 到可审查的补丁</h1><p>选择一个本地 Git 仓库，写下要解决的问题。Agent 会先给出计划，得到你的批准后才会修改代码。</p></div>
+          <div class="view-heading"><p class="eyebrow">开始</p><h1 id="create-title">从仓库到可审查的补丁</h1><p>可以描述问题、从 GitHub 挑选 Issue，或从本地测试失败开始。计划获批后才会修改代码。</p></div>
           <div class="create-card">
-            <div class="segmented" role="tablist" aria-label="任务来源"><button id="mode-local" class="segment active" type="button" role="tab" aria-selected="true">本地 Issue 文本</button><button id="mode-github" class="segment" type="button" role="tab" aria-selected="false">GitHub Issue</button></div>
+            <div class="segmented" role="tablist" aria-label="任务来源"><button id="mode-local" class="segment active" type="button" role="tab" aria-selected="true">本地 Issue 文本</button><button id="mode-github" class="segment" type="button" role="tab" aria-selected="false">GitHub Issue</button><button id="mode-scan" class="segment" type="button" role="tab" aria-selected="false">扫描测试失败</button></div>
             <form id="create-form">
               <label for="repo-path">本地仓库路径</label>
               <input id="repo-path" name="repo_path" type="text" required placeholder="D:\\projects\\example-repo" autocomplete="off">
-              <p class="field-hint">必须是本机已有的 Git 仓库；Agent 会在独立工作区中操作。</p>
+              <p id="repo-hint" class="field-hint">填写干净的 Git 仓库根目录。Agent 会在独立工作区中操作。</p>
               <div id="local-fields"><label for="issue-text">Issue 描述</label><textarea id="issue-text" name="issue" rows="8" placeholder="说明复现步骤、期望行为和边界条件"></textarea></div>
-              <div id="github-fields" hidden><label for="github-repository">GitHub 仓库</label><input id="github-repository" name="repository" type="text" placeholder="owner/repo" autocomplete="off"><label for="github-number">Issue 编号</label><input id="github-number" name="issue_number" type="number" min="1" step="1" placeholder="123"><p class="field-hint">会从 GitHub 读取该 Issue；本地仓库路径仍用于生成和验证补丁。</p></div>
+              <div id="github-fields" hidden><label for="github-repository">GitHub 仓库</label><input id="github-repository" name="repository" type="text" placeholder="owner/repo 或 GitHub 仓库链接" autocomplete="off"><button id="discover-github" class="button button-subtle" type="button">查找开放 Issue</button><ol id="github-candidates" aria-live="polite"></ol><label for="github-number">Issue 编号</label><input id="github-number" name="issue_number" type="number" min="1" step="1" placeholder="从候选选择，或直接填编号"></div>
+              <div id="scan-fields" hidden><button id="discover-scan" class="button button-subtle" type="button">扫描并复现失败</button><p id="scan-status" class="field-hint" aria-live="polite">使用 Docker 运行公开 pytest，需要仓库的测试能在 runner 中启动。</p><label for="scan-failure">可复现的失败用例</label><select id="scan-failure" disabled></select></div>
               <div class="form-actions"><button id="create-submit" class="button button-primary" type="submit">创建任务并生成计划</button><span id="create-feedback" class="muted" aria-live="polite"></span></div>
             </form>
           </div>

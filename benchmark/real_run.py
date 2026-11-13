@@ -360,6 +360,7 @@ def run_review_revise(client, task: str, candidate_patch: str, visible_test_evid
             "This is the final review step. Call review_finish now using only visible evidence."
         ),
         final_step_tool_names={"review_finish"},
+        allow_omitted_positive_review_issues=True,
         terminal_tool_reserve=2,
     )
     if review_state.get("exit_reason") == "llm_error":
@@ -491,6 +492,7 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             )
         review = None
         revision_attempted = False
+        pre_revision_patch = None
         if strategy == "review_revise":
             candidate_modified = sorted(
                 path for path in editable
@@ -502,6 +504,7 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
                 for step in trace if step.get("action") == "run_command"
             )[-2000:]
             if candidate_patch:
+                pre_revision_patch = candidate_patch
                 result, usage, extra_trace, review, revision_attempted = run_review_revise(
                     client, task, candidate_patch, visible_tests, executor, model, usage,
                     max_tokens, max_cost_rmb, reviewer_steps, reviser_steps,
@@ -547,6 +550,7 @@ def evaluate_one(case: RealCase, image: str, cache_root: str | Path,
             "repair_plan": repair_plan,
             "review": review,
             "revision_attempted": revision_attempted,
+            "pre_revision_patch": pre_revision_patch,
             "tests_pass": verification.exit_code == 0,
             "test_tampered": test_tampered, "container_timeout": verification.timed_out,
             "modified_files": modified, "gold_files": list(case.production_files),

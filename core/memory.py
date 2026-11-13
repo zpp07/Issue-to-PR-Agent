@@ -71,7 +71,8 @@ class TaskMemory:
             raise RuntimeError("只有已批准计划可以进入任务记忆")
         parsed = json.loads(plan["content"])
         records = [self._add(
-            task_id, "approved_decision", f"已批准计划：{parsed['goal']}",
+            task_id, "approved_decision",
+            "已批准计划：" + json.dumps(parsed, ensure_ascii=False),
             "artifact", f"plan:{plan['id']}", plan["sha256"],
             {"affected_files": parsed["affected_files"]},
         )]
@@ -111,25 +112,36 @@ class TaskMemory:
         )
 
     def list(self, task_id: str, kinds: list[str] | None = None,
-             limit: int = 100) -> list[dict[str, Any]]:
+             limit: int = 100, *, newest: bool = False, offset: int = 0) -> list[dict[str, Any]]:
         if kinds and any(kind not in MEMORY_KINDS for kind in kinds):
             raise ValueError("包含不允许的记忆类型")
         task = self.store.task(task_id)
-        workspace = Path(task["workspace_path"])
-        records = self.store.memories(task_id, kinds=kinds, limit=limit)
+        workspace = Path(task["workspace_path"]).resolve()
+        records = self.store.memories(task_id, kinds=kinds, limit=limit, newest=newest, offset=offset)
         for record in records:
             record["stale"] = False
             if record["source_type"] == "workspace_file":
                 source = workspace / record["source_ref"]
                 try:
-                    current = _digest(source.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError):
+                    resolved = source.resolve()
+                    current = (_digest(resolved.read_text(encoding="utf-8"))
+                               if workspace in resolved.parents else "")
+                except (OSError, UnicodeDecodeError, RuntimeError):
                     current = ""
                 record["stale"] = current != record["source_sha256"]
         return records
 
     def render_context(self, task_id: str, limit: int = 30) -> str:
-        records = [record for record in self.list(task_id, limit=limit) if not record["stale"]]
+        limit = max(1, min(int(limit), 500))
+        records = []
+        offset = 0
+        while len(records) < limit:
+            page = self.list(task_id, limit=limit, newest=True, offset=offset)
+            records.extend(record for record in page if not record["stale"])
+            if len(page) < limit:
+                break
+            offset += len(page)
+        records = list(reversed(records[:limit]))
         if not records:
             return ""
         lines = ["Trusted task memory (facts only; each line has provenance):"]

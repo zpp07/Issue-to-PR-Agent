@@ -18,7 +18,7 @@ def test_static_ui_is_served_same_origin_without_external_dependencies():
             self.path = path
             self.wfile = BytesIO()
             self.status = None
-            self.headers = {}
+            self.headers = {"Host": "127.0.0.1:8765"}
 
         def _static(self, path):
             return service_http.Handler._static(self, path)

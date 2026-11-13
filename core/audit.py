@@ -1,6 +1,7 @@
 """SQLite-backed task, approval, artifact and append-only audit events."""
 from __future__ import annotations
 
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
@@ -33,10 +34,12 @@ class TaskStore:
         self.database = str(database)
         self._init_schema()
 
+    @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.database)
-        conn.row_factory = sqlite3.Row
-        return conn
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.row_factory = sqlite3.Row
+            with conn:
+                yield conn
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -61,12 +64,18 @@ class TaskStore:
             );
             CREATE INDEX IF NOT EXISTS audit_events_task_sequence
                 ON audit_events(task_id, sequence);
+            CREATE INDEX IF NOT EXISTS approvals_task_subject
+                ON approvals(task_id, kind, subject_hash, decision, created_at);
+            CREATE INDEX IF NOT EXISTS artifacts_task_kind_created
+                ON artifacts(task_id, kind, created_at);
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL,
                 content TEXT NOT NULL, source_type TEXT NOT NULL, source_ref TEXT NOT NULL,
                 source_sha256 TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL,
                 UNIQUE(task_id, kind, content, source_ref, source_sha256)
             );
+            CREATE INDEX IF NOT EXISTS memories_task_created
+                ON memories(task_id, created_at);
             """)
 
     def create_task(self, issue: str, repo_path: str, workspace_path: str, base_commit: str) -> str:
@@ -103,7 +112,10 @@ class TaskStore:
     def set_status(self, task_id: str, status: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?", (status, _now(), task_id))
-        self.event(task_id, "status_changed", {"status": status})
+            conn.execute(
+                "INSERT INTO audit_events(task_id,event_type,payload,created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "status_changed", json.dumps({"status": status}), _now()),
+            )
 
     def transition_status(self, task_id: str, expected: str, status: str) -> bool:
         """Atomically change state and append its audit event, or do nothing."""
@@ -118,6 +130,31 @@ class TaskStore:
                     (task_id, "status_changed", json.dumps({"status": status}), _now()),
                 )
         return changed
+
+    def complete_operation(self, task_id: str, expected: str, status: str, *,
+                           artifacts: list[tuple[str, str, str]],
+                           event: tuple[str, dict[str, Any]]) -> None:
+        """Commit a workflow result, its state and its evidence as one operation."""
+        with self._connect() as conn:
+            changed = conn.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE id=? AND status=?",
+                (status, _now(), task_id, expected),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("保存结果时任务状态已变化")
+            events = []
+            for kind, content, sha256 in artifacts:
+                conn.execute(
+                    "INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?)",
+                    (uuid.uuid4().hex, task_id, kind, sha256, content, _now()),
+                )
+                events.append(("artifact_recorded", {"kind": kind, "sha256": sha256}))
+            events.extend([("status_changed", {"status": status}), event])
+            conn.executemany(
+                "INSERT INTO audit_events(task_id,event_type,payload,created_at) VALUES (?, ?, ?, ?)",
+                [(task_id, name, json.dumps(payload, ensure_ascii=False), _now())
+                 for name, payload in events],
+            )
 
     def claim_execution(self, task_id: str) -> None:
         """Only one caller can move an approved task into execution."""
@@ -156,7 +193,7 @@ class TaskStore:
                 terminal = conn.execute(
                     "SELECT 1 FROM audit_events WHERE task_id=? AND sequence>? "
                     "AND event_type IN "
-                    "('execution_finished','execution_failed','execution_interrupted') LIMIT 1",
+                    "('execution_finished','execution_failed','execution_interrupted','execution_error') LIMIT 1",
                     (task_id, started),
                 ).fetchone()
                 if terminal is not None:
@@ -210,13 +247,37 @@ class TaskStore:
             raise KeyError(f"task {task_id} 没有 {kind} artifact")
         return dict(row)
 
-    def approve(self, task_id: str, kind: str, subject_hash: str, decision: str, actor: str, reason: str | None = None) -> Approval:
+    def approve(self, task_id: str, kind: str, subject_hash: str, decision: str, actor: str,
+                reason: str | None = None, *, transition: tuple[str, str] | None = None) -> Approval:
         if decision not in {"approved", "rejected"}:
             raise ValueError("decision 必须为 approved 或 rejected")
         approval = Approval(uuid.uuid4().hex, task_id, kind, subject_hash, decision, actor, reason, _now())
         with self._connect() as conn:
+            if transition is not None:
+                expected, status = transition
+                changed = conn.execute(
+                    "UPDATE tasks SET status=?, updated_at=? WHERE id=? AND status=?",
+                    (status, _now(), task_id, expected),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError("审批期间任务状态已变化")
+                artifact_kind = {"plan": "plan", "diff": "diff_review", "publish": "draft_pr_request"}[kind]
+                current = conn.execute(
+                    "SELECT sha256 FROM artifacts WHERE task_id=? AND kind=? "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT 1", (task_id, artifact_kind),
+                ).fetchone()
+                if current is None or current["sha256"] != subject_hash:
+                    raise RuntimeError("审批对象已变化")
             conn.execute("INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?, ?, ?)", tuple(asdict(approval).values()))
-        self.event(task_id, "approval_recorded", asdict(approval))
+            conn.execute(
+                "INSERT INTO audit_events(task_id,event_type,payload,created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "approval_recorded", json.dumps(asdict(approval), ensure_ascii=False), _now()),
+            )
+            if transition is not None:
+                conn.execute(
+                    "INSERT INTO audit_events(task_id,event_type,payload,created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, "status_changed", json.dumps({"status": transition[1]}), _now()),
+                )
         return approval
 
     def is_approved(self, task_id: str, kind: str, subject_hash: str) -> bool:
@@ -260,7 +321,7 @@ class TaskStore:
             terminal = conn.execute(
                 "SELECT MAX(sequence) FROM audit_events "
                 "WHERE task_id=? AND sequence>? AND event_type IN "
-                "('execution_finished','execution_failed','execution_interrupted')",
+                "('execution_finished','execution_failed','execution_interrupted','execution_error')",
                 (task_id, started),
             ).fetchone()[0]
         return started, terminal
@@ -291,7 +352,7 @@ class TaskStore:
         return result
 
     def memories(self, task_id: str, kinds: list[str] | None = None,
-                 limit: int = 100) -> list[dict[str, Any]]:
+                 limit: int = 100, *, newest: bool = False, offset: int = 0) -> list[dict[str, Any]]:
         self.task(task_id)  # consistent unknown-task behavior
         limit = max(1, min(int(limit), 500))
         parameters: list[Any] = [task_id]
@@ -300,10 +361,11 @@ class TaskStore:
             placeholders = ",".join("?" for _ in kinds)
             where += f" AND kind IN ({placeholders})"
             parameters.extend(kinds)
-        parameters.append(limit)
+        parameters.extend((limit, offset))
+        order = "created_at DESC, rowid DESC" if newest else "created_at, id"
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM memories WHERE {where} ORDER BY created_at, id LIMIT ?",
+                f"SELECT * FROM memories WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]

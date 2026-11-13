@@ -47,7 +47,9 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
                        usage=None, trace=None, verbose=True, executor=None,
                        workspace=None, coder_tools=None, reviewer_tools=None,
                        on_event: Callable[[dict[str, Any]], None] | None = None,
-                       has_candidate_patch: Callable[[], bool] | None = None):
+                       has_candidate_patch: Callable[[], bool] | None = None,
+                       review_evidence: Callable[[], str] | None = None,
+                       max_tokens=None, max_cost_rmb=None, on_usage=None):
     """Coder 修 → Reviewer 查 → 不通过喂回意见，最多 max_rounds 轮。
 
     返回 (passed, review_issues, rounds, usage)。
@@ -55,14 +57,13 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
     model = resolve_model(model)
     if usage is None:
         usage = Usage()
-    coder_task = task
-    # 推导工作目录：目标文件所在目录。agent 的所有文件/命令操作都被限制在这里，
-    # 避免它用 `cd` 逃出沙箱、污染工作区之外的文件。
+    # File tools enforce path scope. A command's initial directory is not isolation.
     workdir = os.path.abspath(workspace) if workspace else os.path.dirname(os.path.abspath(target_file))
     target_display = os.path.relpath(os.path.abspath(target_file), workdir)
     coder_task = f"目标文件：{target_display}\n\n原始任务：{task}"
     coder_tools = coder_tools or CODERS
     reviewer_tools = reviewer_tools or REVIEWERS
+    bound_executor = executor or make_executor(workdir)
 
     def phase_callback(phase: str, round_num: int):
         if on_event is None:
@@ -80,12 +81,11 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
         # Coder 修复
         if verbose:
             print("[Coder] 修复中...")
-        coder_executor = executor or make_executor(workdir)
-        coder_task = coder_task.replace(target_file, target_display)
         coder_result, usage = run_agent(
             client, CODER_PROMPT, coder_tools, coder_task,
             model=model, usage=usage, trace=trace,
-            execute_tool=coder_executor,
+            execute_tool=bound_executor, max_tokens=max_tokens, max_cost_rmb=max_cost_rmb,
+            on_usage=on_usage,
             on_event=phase_callback("coder", round_num),
         )
         if verbose:
@@ -104,17 +104,20 @@ def multi_agent_review(client, target_file, task="修复代码中的 bug",
         # Reviewer 审查（只读 + 结构化结论）
         if verbose:
             print("[Reviewer] 审查中...")
-        review_executor = executor or make_executor(workdir)
+        evidence = review_evidence() if review_evidence is not None else ""
         review, usage = run_agent(
             client, REVIEWER_PROMPT, reviewer_tools,
-            f"原始任务：{task}\n\n请审查文件 {target_display} 的候选修改是否满足任务要求。",
+            f"原始任务：{task}\n\n请审查以 {target_display} 为起点的候选修改。\n\n{evidence}",
             model=model, usage=usage, trace=trace,
-            execute_tool=review_executor,
+            execute_tool=bound_executor, max_tokens=max_tokens, max_cost_rmb=max_cost_rmb,
+            on_usage=on_usage,
             on_event=phase_callback("reviewer", round_num),
         )
-        if isinstance(review, dict):
-            passed = bool(review.get("passed"))
-            issues = list(review.get("issues") or [])
+        if (isinstance(review, dict) and type(review.get("passed")) is bool
+                and isinstance(review.get("issues"), list)
+                and all(isinstance(issue, str) for issue in review["issues"])):
+            passed = review["passed"] and not review["issues"]
+            issues = review["issues"]
         else:
             # 兜底：审查员没走 review_finish，保守判不通过
             passed, issues = False, [str(review)[:200]]

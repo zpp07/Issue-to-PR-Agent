@@ -1,0 +1,145 @@
+"""Freeze public validation input and check evidence outside the test process."""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import secrets
+import shutil
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
+
+from core.candidate import candidate
+
+
+_HARNESS = r"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+
+with tempfile.TemporaryDirectory() as temp:
+    report = Path(temp) / "junit.xml"
+    collection = Path(temp) / "collection.json"
+    env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    env.pop("PYTEST_ADDOPTS", None)
+    options = ["-o", "addopts=", "-o", "pythonpath=.", "-p", "no:cacheprovider", "-q"]
+    collector = '''
+import json
+from pathlib import Path
+import sys
+import pytest
+class Collection:
+    def pytest_collection_finish(self, session):
+        Path(sys.argv[1]).write_text(json.dumps([item.nodeid for item in session.items]), encoding="utf-8")
+raise SystemExit(pytest.main(sys.argv[2:], plugins=[Collection()]))
+'''
+    collected = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", collector, str(collection),
+         *options, "--collect-only", *sys.argv[2:]], env=env,
+    )
+    if collected.returncode:
+        sys.exit(collected.returncode)
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-m", "pytest", *options, "--junitxml", str(report), *sys.argv[2:]], env=env,
+    )
+    try:
+        if (not report.is_file() or report.stat().st_size > 4_000_000
+                or not collection.is_file() or collection.stat().st_size > 4_000_000):
+            raise ValueError("missing or oversized report")
+        expected = json.loads(collection.read_text(encoding="utf-8"))
+        suites = ET.parse(report).getroot().findall("./testsuite")
+        cases = [case for suite in suites for case in suite.findall("testcase")]
+        declared = sum(int(suite.attrib["tests"]) for suite in suites)
+        if not isinstance(expected, list) or not expected or declared != len(cases) or declared != len(expected):
+            raise ValueError("inconsistent report")
+        passed = sum(not any(case.find(tag) is not None for tag in
+                             ("failure", "error", "skipped")) for case in cases)
+        failed = sum(int(suite.attrib["failures"]) + int(suite.attrib["errors"]) for suite in suites)
+        print(sys.argv[1] + json.dumps({"cases": declared, "collected": len(expected),
+                                      "passed": passed, "failed": failed}), flush=True)
+        sys.exit(result.returncode or (0 if passed > 0 and failed == 0 else 5))
+    except (OSError, ValueError, KeyError, ET.ParseError):
+        sys.exit(result.returncode or 5)
+"""
+
+
+def _paths(workspace: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "-C", str(workspace), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        capture_output=True, check=True, timeout=30,
+    )
+    return sorted(set(result.stdout.decode("utf-8").split("\0")) - {""})
+
+
+def _manifest(workspace: Path, paths: list[str], snapshot: Path | None = None) -> str:
+    digest = hashlib.sha256()
+    for relative in paths:
+        path = workspace / relative
+        if path.is_symlink() or path.resolve() != path:
+            raise ValueError(f"公开验证暂不支持链接路径：{relative}")
+        if not path.exists():
+            continue
+        if not path.is_file():
+            raise ValueError(f"公开验证暂不支持非普通文件：{relative}")
+        data = path.read_bytes()
+        digest.update(relative.encode("utf-8") + b"\0" + hashlib.sha256(data).digest())
+        if snapshot is not None:
+            dest = snapshot / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            shutil.copymode(path, dest)
+    return digest.hexdigest()
+
+
+def verify_public(workspace: Path, test_paths: list[str], sandbox, *,
+                  base_commit: str | None = None, expected_tree: str | None = None) -> tuple[int, str, dict]:
+    """Report counts detect ordinary empty/aborted runs, not malicious pytest."""
+    marker = f"PUBLIC_JUNIT_{secrets.token_hex(12)}="
+    python = "python" if sandbox else sys.executable
+    argv = [python, "-I", "-B", "-c", _HARNESS, marker, *test_paths]
+    paths = _paths(workspace)
+    with TemporaryDirectory(prefix="issue-to-pr-verify-") as directory:
+        snapshot = Path(directory).resolve()
+        # The Docker runner's unprivileged UID needs to traverse this directory.
+        snapshot.chmod(0o755)
+        before = _manifest(workspace, paths, snapshot)
+        if base_commit and candidate(workspace, base_commit, snapshot=snapshot).tree != expected_tree:
+            return 1, "公开验证快照与候选 Git tree 不一致", {
+                "snapshot_sha256": before, "snapshot_unchanged": False,
+            }
+        if sandbox:
+            result = sandbox.run(snapshot, argv, workdir=snapshot, read_only_workspace=True, timeout=60)
+            code, output = result.exit_code, result.output
+            image_id = getattr(result, "image_id", None)
+        else:
+            try:
+                result = subprocess.run(argv, cwd=snapshot, capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace", timeout=60)
+                code, output = result.returncode, result.stdout + result.stderr
+            except subprocess.TimeoutExpired:
+                code, output = 124, "可信本地验证超时"
+            image_id = None
+        snapshot_paths = sorted(path.relative_to(snapshot).as_posix()
+                                for path in snapshot.rglob("*") if path.is_file() or path.is_symlink())
+        unchanged = (snapshot_paths == [path for path in paths if (workspace / path).is_file()]
+                     and before == _manifest(snapshot, paths)
+                     and paths == _paths(workspace)
+                     and before == _manifest(workspace, paths))
+    matches = [line[len(marker):] for line in output.splitlines() if line.startswith(marker)]
+    try:
+        counts = json.loads(matches[0]) if len(matches) == 1 else {}
+    except ValueError:
+        counts = {}
+    valid = (isinstance(counts, dict) and type(counts.get("cases")) is int
+             and type(counts.get("collected")) is int and counts["collected"] == counts["cases"]
+             and type(counts.get("passed")) is int and type(counts.get("failed")) is int
+             and counts["cases"] >= counts["passed"] > 0 and counts["failed"] == 0)
+    evidence = {"selected_paths": test_paths, "snapshot_sha256": before, "snapshot_unchanged": unchanged,
+                "junit": counts if valid else None, "runner_image_id": image_id,
+                "execution_mode": "docker" if sandbox else "trusted_local"}
+    return code or (0 if unchanged and valid else 1), output or "(无测试输出)", evidence

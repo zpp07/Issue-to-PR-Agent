@@ -1,25 +1,30 @@
 """Application adapter that joins planner, Coder/Reviewer, and Phase-2 workflow."""
 from __future__ import annotations
 
+import json
+import math
+import os
 from pathlib import Path
-import subprocess
-import sys
 from typing import Any
 
 from core.agent import run_agent
 from core.client import resolve_model
+from core.candidate import candidate, git_run
 from core.github import GitHubAPI
 from core.policy import CommandPolicy
 from core.search import build_code_search
 from core.tools import build_tool_registry, make_executor
-from core.workflow import IssueToPRWorkflow, TaskContext
+from core.usage import Usage
+from core.sandbox import DockerUnavailable
+from core.verification import verify_public
+from core.workflow import IssueToPRWorkflow, TaskContext, _digest
 from coder_reviewer import multi_agent_review
 
-PLANNER_TOOLS = build_tool_registry("search_code", "read_file", "plan_finish")
+PLANNER_TOOLS = build_tool_registry("search_code", "read_file", "read_symbol", "plan_finish")
 SEARCH_CODER_TOOLS = build_tool_registry(
-    "search_code", "read_file", "replace_text", "write_file", "run_command", "finish",
+    "search_code", "read_file", "read_symbol", "replace_text", "write_file", "run_command", "finish",
 )
-SEARCH_REVIEWER_TOOLS = build_tool_registry("search_code", "read_file", "review_finish")
+SEARCH_REVIEWER_TOOLS = build_tool_registry("search_code", "read_file", "read_symbol", "review_finish")
 PLANNER_PROMPT = """你是 Python 项目的变更规划员。先阅读与 issue 相关的文件，
 优先使用 search_code 找到符号、调用方、测试和文档契约，再用 read_file 精读证据。
 只做计划，绝不修改代码或运行命令。最后必须调用 plan_finish，给出：目标、可能受影响
@@ -115,22 +120,35 @@ def _validate_plan(plan: Any) -> dict[str, Any]:
 
 
 def _has_candidate_patch(workspace: Path, base_commit: str) -> bool:
-    """Check the tracked diff that record_execution and PR publication use."""
-    result = subprocess.run(
-        ["git", "-C", str(workspace), "diff", "--no-ext-diff", "--quiet", base_commit],
-        capture_output=True, check=False,
-    )
-    if result.returncode not in (0, 1):
-        raise RuntimeError("无法检查任务工作区的候选补丁")
-    return result.returncode == 1
+    return bool(candidate(workspace, base_commit).diff)
 
 
 class IssueToPRService:
-    def __init__(self, workflow: IssueToPRWorkflow, client, model: str | None = None, sandbox=None):
+    def __init__(self, workflow: IssueToPRWorkflow, client, model: str | None = None, sandbox=None,
+                 *, trusted_local: bool = False):
         self.workflow = workflow
         self.client = client
         self.model = resolve_model(model)
         self.sandbox = sandbox
+        self.trusted_local = trusted_local
+
+    def _budget(self, task_id):
+        usage = Usage()
+        for event in self.workflow.store.events(task_id):
+            if event["event_type"] == "model_usage":
+                item = json.loads(event["payload"])
+                usage.add(item["prompt_tokens"], item["completion_tokens"])
+        tokens = int(os.environ["AGENT_TASK_MAX_TOKENS"]) if "AGENT_TASK_MAX_TOKENS" in os.environ else None
+        cost = float(os.environ["AGENT_TASK_MAX_COST_RMB"]) if "AGENT_TASK_MAX_COST_RMB" in os.environ else None
+        if (tokens is not None and tokens <= 0) or (cost is not None and (cost <= 0 or not math.isfinite(cost))):
+            raise ValueError("任务预算必须为正数")
+
+        def record(prompt, completion):
+            self.workflow.store.event(task_id, "model_usage", {
+                "prompt_tokens": prompt, "completion_tokens": completion,
+            })
+
+        return {"usage": usage, "max_tokens": tokens, "max_cost_rmb": cost, "on_usage": record}
 
     def create_and_plan(self, repo_path: str | Path, issue: str) -> tuple[TaskContext, dict[str, Any], str]:
         context = self.workflow.create_task(repo_path, issue)
@@ -147,9 +165,11 @@ class IssueToPRService:
             f"{issue['body']}\n\nSource: {issue['html_url']}"
         ).strip()
         context, plan, plan_hash = self.create_and_plan(repo_path, issue_text)
+        branch = git_run(Path(repo_path).resolve(), ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False)
         self.workflow.store.event(context.task_id, "github_issue_imported", {
             "repository": issue["repository"], "number": issue["number"],
-            "html_url": issue["html_url"], "state": issue["state"],
+            "html_url": issue["html_url"], "state": issue["state"], "title": issue["title"],
+            "base_branch": branch.stdout.strip() if branch.returncode == 0 else None,
         })
         return context, plan, plan_hash, issue
 
@@ -170,16 +190,18 @@ class IssueToPRService:
                 "说明不确定性，不要继续检索或编造。"
             ),
             final_step_tool_names={"plan_finish"}, terminal_tool_reserve=2,
-            run_state=planner_state,
+            run_state=planner_state, **self._budget(task_id),
         )
         exit_reason = str(planner_state.get("exit_reason", "unknown"))
         steps_used = planner_state.get("budget_state", {}).get("steps_used", 0)
 
         def planning_failed(reason: str) -> None:
-            self.workflow.store.event(task_id, "planning_failed", {
-                "reason": reason, "exit_reason": exit_reason, "steps_used": steps_used,
-            })
-            self.workflow.store.set_status(task_id, "planning_failed")
+            self.workflow.store.complete_operation(
+                task_id, task["status"], "planning_failed", artifacts=[],
+                event=("planning_failed", {
+                    "reason": reason, "exit_reason": exit_reason, "steps_used": steps_used,
+                }),
+            )
 
         if isinstance(result, dict) and result.get("retryable"):
             planning_failed("llm_error")
@@ -200,8 +222,12 @@ class IssueToPRService:
         return plan, plan_hash
 
     def execute_after_plan_approval(self, task_id: str, target_file: str, max_rounds: int = 3) -> dict[str, str]:
+        if self.sandbox is None and not self.trusted_local:
+            raise DockerUnavailable("执行仓库代码需要 Docker；可信本地执行须显式启用 trusted_local")
+        if self.sandbox is not None:
+            self.sandbox.require_available()
         task = self.workflow.store.task(task_id)
-        workspace = Path(task["workspace_path"])
+        workspace = Path(task["workspace_path"]).resolve()
         target = (workspace / target_file).resolve()
         if workspace not in target.parents or not target.is_file():
             raise ValueError("target_file 必须是任务工作区内的现有文件")
@@ -209,14 +235,7 @@ class IssueToPRService:
         code_search = build_code_search(workspace)
         executor = self.workflow.executor_for(
             task_id, workspace, command_runner=command_runner, code_search=code_search,
-        )
-        passed, issues, rounds, usage = multi_agent_review(
-            self.client, str(target), task=self._task_with_memory(task_id, task["issue"]),
-            max_rounds=max_rounds,
-            model=self.model, verbose=False, executor=executor, workspace=workspace,
-            coder_tools=SEARCH_CODER_TOOLS, reviewer_tools=SEARCH_REVIEWER_TOOLS,
-            on_event=self._execution_event_callback(task_id),
-            has_candidate_patch=lambda: _has_candidate_patch(workspace, task["base_commit"]),
+            enforce_plan=True,
         )
         # Prefer the conventional target-specific test.  It prevents unrelated
         # benchmark fixtures with duplicate names from poisoning independent
@@ -228,23 +247,46 @@ class IssueToPRService:
         sibling_test = target.parent / f"test_{target.stem}.py"
         conventional_test = workspace / "tests" / f"test_{target.stem}.py"
         target_test = sibling_test if sibling_test.is_file() else conventional_test
-        python_executable = "python" if self.sandbox else sys.executable
-        test_argv = [python_executable, "-m", "pytest", str(target_test.relative_to(workspace)), "-q"] \
-            if target_test.is_file() else [python_executable, "-m", "pytest", "-q"]
-        if self.sandbox:
-            test_result = self.sandbox.run(workspace, test_argv, workdir=workspace, timeout=60)
-            test_code, test_report = test_result.exit_code, test_result.output
-        else:
-            test = subprocess.run(
-                test_argv, cwd=workspace, timeout=60,
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
+        test_paths = [target_test.relative_to(workspace).as_posix()] if target_test.is_file() else []
+        tested = None
+        approved_plan = self.workflow.store.latest_artifact(task_id, "plan")
+        task_text = self._task_with_memory(task_id, task["issue"])
+        task_text += (f"\n\n当前已批准计划（SHA-256: {approved_plan['sha256']}）:\n"
+                      + approved_plan["content"])
+
+        def review_evidence():
+            nonlocal tested
+            patch = candidate(workspace, task["base_commit"])
+            code, output, evidence = verify_public(
+                workspace, test_paths, self.sandbox, base_commit=task["base_commit"], expected_tree=patch.tree,
             )
-            test_code = test.returncode
-            test_report = (test.stdout + test.stderr) or "(无测试输出)"
+            tested = (patch, code, output, evidence)
+            self.workflow.store.event(task_id, "public_candidate_verified", {
+                "tree": patch.tree, "diff_sha256": _digest(patch.diff),
+                "test_report_sha256": _digest(output), "exit_code": code,
+            })
+            return (f"候选 Git tree: {patch.tree}\n完整候选 Diff:\n{patch.diff}\n\n"
+                    f"公开验证退出码: {code}\n证据: {json.dumps(evidence, ensure_ascii=False)}\n{output}")
+
+        passed, issues, rounds, usage = multi_agent_review(
+            self.client, str(target), task=task_text,
+            max_rounds=max_rounds,
+            model=self.model, verbose=False, executor=executor, workspace=workspace,
+            coder_tools=SEARCH_CODER_TOOLS, reviewer_tools=SEARCH_REVIEWER_TOOLS,
+            on_event=self._execution_event_callback(task_id),
+            has_candidate_patch=lambda: _has_candidate_patch(workspace, task["base_commit"]),
+            review_evidence=review_evidence, **self._budget(task_id),
+        )
+        if tested is None:
+            return self.workflow.record_execution(task_id, "没有可验证的候选补丁",
+                                                  {"passed": False, "issues": issues, "tests_exit_code": 5})
+        patch, test_code, test_report, evidence = tested
         review = {"passed": passed, "issues": issues, "rounds": rounds,
                   "tokens": usage.total_tokens, "tests_exit_code": test_code,
-                  "test_argv": test_argv}
-        return self.workflow.record_execution(task_id, test_report, review)
+                  "test_argv": ["python", "-m", "pytest", *test_paths, "-q"],
+                  "public_verification": evidence}
+        return self.workflow.record_execution(task_id, test_report, review, tested_diff=_digest(patch.diff),
+                                              tested_tree=patch.tree)
 
     def _execution_event_callback(self, task_id: str):
         """Persist bounded, public progress; keep all other audit events intact."""

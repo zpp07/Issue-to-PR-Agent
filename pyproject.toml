@@ -18,7 +18,7 @@ web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 rag = ["sentence-transformers>=3.0", "numpy>=1.26"]
 
 [tool.setuptools]
-py-modules = ["coder_reviewer", "issue_to_pr", "service_api", "service_http"]
+py-modules = ["coder_reviewer", "issue_to_pr", "service_api", "service_http", "service_trial"]
 
 [tool.setuptools.packages.find]
 where = ["."]

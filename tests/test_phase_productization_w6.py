@@ -75,6 +75,9 @@ def test_ui_http_flow_reaches_ready_to_publish_with_fake_client(tmp_path, monkey
     )))
 
     class FakeSandbox:
+        def require_available(self):
+            pass
+
         def command_runner(self, workspace):
             def unexpected_command(*args, **kwargs):
                 raise AssertionError("Coder did not request a shell command")
@@ -83,8 +86,10 @@ def test_ui_http_flow_reaches_ready_to_publish_with_fake_client(tmp_path, monkey
 
         def run(self, workspace, argv, **kwargs):
             assert Path(workspace).is_dir()
-            assert argv == ["python", "-m", "pytest", "test_buggy.py", "-q"]
-            return SimpleNamespace(exit_code=0, output="1 passed (fake sandbox)")
+            assert Path(workspace).parent != workflow.workspace_root
+            assert kwargs["read_only_workspace"] is True
+            assert argv[-1] == "test_buggy.py"
+            return SimpleNamespace(exit_code=0, output=argv[-2] + '{"cases":1,"collected":1,"passed":1,"failed":0}')
 
     def service():
         return IssueToPRService(workflow, client, sandbox=FakeSandbox())

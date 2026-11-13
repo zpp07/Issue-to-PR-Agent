@@ -26,6 +26,7 @@ const state = {
   realPublisher: false, publishRequest: null, publishing: false,
   pollTimer: null, pollToken: 0, pollCursor: 0, loadingGeneration: 0,
   diffPage: 0, seenDiffPages: new Set(), fullDiffShown: false,
+  scan: null,
 };
 
 function text(node, value) { node.textContent = value == null ? "" : String(value); }
@@ -117,24 +118,90 @@ function showCreate() {
 function setCreateMode(mode) {
   state.createMode = mode;
   const github = mode === "github";
-  $("local-fields").hidden = github;
+  $("local-fields").hidden = mode !== "local";
   $("github-fields").hidden = !github;
-  $("mode-local").classList.toggle("active", !github);
-  $("mode-github").classList.toggle("active", github);
-  $("mode-local").setAttribute("aria-selected", String(!github));
-  $("mode-github").setAttribute("aria-selected", String(github));
+  $("scan-fields").hidden = mode !== "scan";
+  $("repo-path").required = !github;
+  text($("repo-hint"), github ? "留空时会浅克隆公开 GitHub 仓库。已有干净的本机仓库也可填写。"
+    : "填写干净的 Git 仓库根目录。Agent 会在独立工作区中操作。");
+  for (const name of ["local", "github", "scan"]) {
+    $("mode-" + name).classList.toggle("active", name === mode);
+    $("mode-" + name).setAttribute("aria-selected", String(name === mode));
+  }
 }
+async function discoverGithub() {
+  const repository = $("github-repository").value.trim();
+  if (!repository) return report(new Error("请填写 GitHub 仓库。"));
+  const button = $("discover-github");
+  const list = $("github-candidates");
+  list.replaceChildren();
+  setBusy(button, true, "查找开放 Issue");
+  try {
+    const {body} = await api("POST", "/discovery/github", {repository});
+    if ($("github-repository").value.trim() !== repository) return;
+    for (const issue of body.issues) {
+      const item = element("li");
+      const select = element("button", "button button-subtle", `选择 #${issue.number} ${issue.title}`);
+      select.type = "button";
+      select.addEventListener("click", () => { $("github-number").value = issue.number; });
+      item.append(select, element("p", "field-hint", issue.reasons.join(" · ")),
+        element("p", "field-hint", issue.excerpt));
+      const source = new URL(issue.url);
+      if (source.protocol === "https:" && source.hostname === "github.com") {
+        const link = element("a", "field-hint", "GitHub 原文 ↗");
+        link.href = source.href;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        item.append(link);
+      }
+      list.append(item);
+    }
+    if (!body.issues.length) list.append(element("li", "muted", "没有找到有足够线索的开放 Issue。"));
+  } catch (error) { report(error); }
+  finally { setBusy(button, false, "查找开放 Issue"); }
+}
+
+function clearScan() {
+  state.scan = null;
+  $("scan-failure").replaceChildren();
+  $("scan-failure").disabled = true;
+  text($("scan-status"), "使用 Docker 运行公开 pytest，需要仓库的测试能在 runner 中启动。");
+}
+
+async function discoverScan() {
+  const repo_path = $("repo-path").value.trim();
+  if (!repo_path) return report(new Error("请填写本地仓库路径。"));
+  const button = $("discover-scan");
+  clearScan();
+  setBusy(button, true, "扫描并复现失败");
+  try {
+    const {body} = await api("POST", "/discovery/scan", {repo_path});
+    if ($("repo-path").value.trim() !== repo_path) return;
+    state.scan = {repo_path, base_commit: body.base_commit};
+    for (const failure of body.failures) $("scan-failure").append(new Option(failure, failure));
+    $("scan-failure").disabled = !body.failures.length;
+    text($("scan-status"), body.failures.length ? "以下失败已在同一基线上复现两次。"
+      : body.status === "passed" ? "测试通过，未生成修复任务。" : "未取得可重复的用例失败。请检查 runner 依赖或测试配置。");
+  } catch (error) { report(error); }
+  finally { setBusy(button, false, "扫描并复现失败"); }
+}
+
 async function createTask(event) {
   event.preventDefault();
   const button = $("create-submit");
   const repoPath = $("repo-path").value.trim();
   let path, payload;
-  if (!repoPath) return report(new Error("请填写本地仓库路径。"));
+  if (!repoPath && state.createMode !== "github") return report(new Error("请填写本地仓库路径。"));
   if (state.createMode === "local") {
     const issue = $("issue-text").value.trim();
     if (!issue) return report(new Error("请填写 Issue 描述。"));
     path = "/tasks";
     payload = {repo_path: repoPath, issue};
+  } else if (state.createMode === "scan") {
+    const failure = $("scan-failure").value;
+    if (!failure || state.scan?.repo_path !== repoPath) return report(new Error("请先扫描并选择失败用例。"));
+    path = "/tasks/scan";
+    payload = {...state.scan, failure};
   } else {
     const repository = $("github-repository").value.trim();
     const issueNumber = Number($("github-number").value);
@@ -180,6 +247,7 @@ async function openTask(taskId, tab = null) {
     api("GET", `/tasks/${encoded}`), api("GET", `/tasks/${encoded}/artifacts`),
   ]);
   if (generation !== state.loadingGeneration) return;
+  const switchingTasks = state.task?.id !== detail.task.id;
   state.task = detail.task;
   state.events = Array.isArray(detail.events) ? detail.events : [];
   state.eventSequences = new Set(state.events.map((event) => event.sequence));
@@ -188,6 +256,17 @@ async function openTask(taskId, tab = null) {
   state.diffPage = 0;
   state.seenDiffPages = new Set();
   state.fullDiffShown = false;
+  if (switchingTasks) {
+    $("draft-form").reset();
+    const source = state.events.find((event) => event.event_type === "github_issue_imported");
+    if (source) {
+      const issue = JSON.parse(source.payload);
+      $("draft-repository").value = issue.repository;
+      $("draft-base").value = issue.base_branch || "main";
+      $("draft-head").value = `agent/issue-${issue.number}-${state.task.id.slice(0, 8)}`;
+      $("draft-title-input").value = `Fix #${issue.number}: ${issue.title || "GitHub Issue"}`.slice(0, 256);
+    }
+  }
   state.tab = tab || preferredTab(state.task.status);
   $("create-view").hidden = true;
   $("detail-view").hidden = false;
@@ -671,6 +750,14 @@ function wireEvents() {
   $("refresh-task-button").addEventListener("click", () => state.task && openTask(state.task.id, state.tab).catch(report));
   $("mode-local").addEventListener("click", () => setCreateMode("local"));
   $("mode-github").addEventListener("click", () => setCreateMode("github"));
+  $("mode-scan").addEventListener("click", () => setCreateMode("scan"));
+  $("discover-github").addEventListener("click", discoverGithub);
+  $("discover-scan").addEventListener("click", discoverScan);
+  $("repo-path").addEventListener("input", clearScan);
+  $("github-repository").addEventListener("input", () => {
+    $("github-number").value = "";
+    $("github-candidates").replaceChildren();
+  });
   $("create-form").addEventListener("submit", createTask);
   for (const button of document.querySelectorAll(".detail-tab")) button.addEventListener("click", () => setTab(button.dataset.tab).catch(report));
   $("approve-plan-button").addEventListener("click", () => decidePlan("approved"));

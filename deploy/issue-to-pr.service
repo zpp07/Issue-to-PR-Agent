@@ -1,0 +1,23 @@
+[Unit]
+Description=Private Issue-to-PR workbench
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+SupplementaryGroups=docker
+WorkingDirectory=/opt/issue-to-pr/current
+Environment=AGENT_DATA_DIR=/var/lib/issue-to-pr
+Environment=PYTHONUTF8=1
+EnvironmentFile=/etc/issue-to-pr.env
+StateDirectory=issue-to-pr
+StateDirectoryMode=0700
+UMask=0022
+ExecStart=/opt/issue-to-pr/current/.venv/bin/python service_http.py --fake-publisher
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

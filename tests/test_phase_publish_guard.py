@@ -6,6 +6,7 @@ import threading
 import pytest
 
 from core.audit import TaskStore
+from core.candidate import Candidate
 from core.workflow import IssueToPRWorkflow, _digest
 
 
@@ -13,7 +14,7 @@ from core.workflow import IssueToPRWorkflow, _digest
 def workflow(tmp_path, monkeypatch):
     store = TaskStore(tmp_path / "tasks.sqlite3")
     workflow = IssueToPRWorkflow(store, tmp_path / "workspaces")
-    monkeypatch.setattr("core.workflow._git", lambda *args: "approved patch")
+    monkeypatch.setattr("core.workflow.candidate", lambda *args: Candidate("approved patch", "tree", ()))
     return workflow
 
 

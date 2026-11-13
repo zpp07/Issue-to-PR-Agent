@@ -195,6 +195,7 @@ def test_github_api_always_requests_a_draft_pr():
             return json.dumps({
                 "number": 9, "html_url": "https://github.com/owner/repo/pull/9",
                 "draft": True,
+                "head": {"ref": "agent/fix", "sha": "abc123"}, "base": {"ref": "main"},
             }).encode()
 
     class Opener:

@@ -48,6 +48,13 @@ h3{font-size:1rem;margin:.8rem 0 .3rem}
 .detail-issue{max-height:6rem;overflow:auto;white-space:pre-wrap}
 .create-card,.stage-panel{background:var(--surface);border:1px solid var(--border);border-radius:15px;box-shadow:0 18px 50px #0208122b}
 .create-card{max-width:820px;padding:clamp(1.1rem,3vw,2rem)}
+#discover-github,#discover-scan{margin:.7rem 0}
+#github-candidates:empty{display:none}
+#github-candidates li{margin-block:.7rem}
+.trial-content{max-width:920px}
+.trial-content .create-card{max-width:none}
+.trial-content .stage-panel{margin-top:1rem;padding:1rem}
+.trial-content pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:.85rem}
 .segmented{display:inline-flex;padding:.26rem;border:1px solid var(--border);border-radius:10px;background:#0b1928;margin-bottom:1.7rem;gap:.25rem}
 .segment{border:0;background:transparent;color:var(--muted);padding:.53rem .9rem;border-radius:7px;font-weight:650}
 .segment.active{color:#08251f;background:var(--accent)}

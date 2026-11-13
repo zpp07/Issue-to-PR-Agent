@@ -7,11 +7,12 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, build_opener
+
+from core.candidate import candidate, committed_diff, git_run as _git
 
 
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -50,7 +51,11 @@ def repository_from_remote(remote_url: str) -> str:
     if value.startswith("git@github.com:"):
         return validate_repository(value.split(":", 1)[1])
     parsed = urlparse(value)
-    if parsed.hostname != "github.com":
+    if (parsed.hostname != "github.com" or parsed.scheme not in {"https", "ssh"}
+            or parsed.password or parsed.query or parsed.fragment or parsed.params
+            or parsed.port is not None
+            or (parsed.scheme == "https" and parsed.username is not None)
+            or (parsed.scheme == "ssh" and parsed.username != "git")):
         raise ValueError("当前发布器只允许 github.com remote")
     return validate_repository(parsed.path.strip("/"))
 
@@ -95,6 +100,10 @@ class GitHubAPI:
         result = self._request("GET", f"/repos/{repository}/issues/{int(number)}")
         if "pull_request" in result:
             raise ValueError("给定编号是 Pull Request，不是 Issue")
+        return self._issue(repository, result)
+
+    @staticmethod
+    def _issue(repository: str, result: dict) -> dict[str, Any]:
         return {
             "repository": repository,
             "number": int(result["number"]),
@@ -103,6 +112,18 @@ class GitHubAPI:
             "html_url": str(result.get("html_url") or ""),
             "state": str(result.get("state") or ""),
         }
+
+    def list_open_issues(self, repository: str) -> list[dict[str, Any]]:
+        repository = validate_repository(repository)
+        query = urlencode({"state": "open", "sort": "updated", "per_page": 50})
+        results = self._request("GET", f"/repos/{repository}/issues?{query}")
+        if not isinstance(results, list):
+            raise GitHubError("GitHub 未返回 Issue 列表")
+        return [{**self._issue(repository, row),
+                 "labels": [label["name"] for label in row.get("labels", [])],
+                 "assigned": bool(row.get("assignees"))}
+                for row in results if isinstance(row, dict) and "pull_request" not in row
+                and row.get("state") == "open"]
 
     def find_open_pull(self, repository: str, owner: str, branch: str) -> dict[str, Any] | None:
         repository = validate_repository(repository)
@@ -119,24 +140,21 @@ class GitHubAPI:
         })
         if result.get("draft") is not True:
             raise GitHubError("GitHub 未返回 draft=true，拒绝把结果视为已完成")
+        actual_head, actual_base = result.get("head") or {}, result.get("base") or {}
+        if actual_head.get("ref") != head or actual_base.get("ref") != base:
+            raise GitHubError("GitHub 返回的 Draft PR 分支与请求不一致")
         return {
             "number": int(result["number"]),
             "html_url": str(result["html_url"]),
             "draft": True,
             "head": head,
             "base": base,
+            "commit": actual_head.get("sha"),
         }
 
 
-def _git(repo: Path, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo), *argv], check=check, capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-
-
 def _diff(repo: Path, base_commit: str) -> str:
-    return _git(repo, ["diff", "--no-ext-diff", "--binary", base_commit]).stdout.strip()
+    return candidate(repo, base_commit).diff
 
 
 @dataclass
@@ -156,16 +174,13 @@ class GitHubDraftPRPublisher:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", remote):
             raise ValueError("remote 名称不合法")
 
-        status = _git(repo, ["status", "--porcelain", "--untracked-files=all"]).stdout.splitlines()
-        untracked = [line for line in status if line.startswith("??")]
-        if untracked:
-            raise GitHubError("发布前发现未审批的未跟踪文件")
-        current_diff = _diff(repo, base_commit)
-        if hashlib.sha256(current_diff.encode("utf-8")).hexdigest() != expected_diff_sha256:
+        patch = candidate(repo, base_commit)
+        if (not patch.diff or hashlib.sha256(patch.diff.encode("utf-8")).hexdigest() != expected_diff_sha256
+                or request.get("candidate_tree", patch.tree) != patch.tree):
             raise GitHubError("发布前 diff 已变化，旧审批失效")
 
-        remote_url = _git(repo, ["remote", "get-url", remote]).stdout.strip()
-        if repository_from_remote(remote_url).lower() != repository.lower():
+        push_urls = _git(repo, ["remote", "get-url", "--push", "--all", remote]).stdout.splitlines()
+        if len(push_urls) != 1 or repository_from_remote(push_urls[0]).lower() != repository.lower():
             raise GitHubError("发布请求中的 repository 与 Git remote 不一致")
 
         head_commit = _git(repo, ["rev-parse", "HEAD"]).stdout.strip()
@@ -176,30 +191,32 @@ class GitHubDraftPRPublisher:
                 _git(repo, ["checkout", "-b", head_branch])
             elif current_branch != head_branch:
                 raise GitHubError("基础提交已位于其他分支，拒绝覆盖")
-            _git(repo, ["add", "-u"])
-            staged = _git(repo, ["diff", "--cached", "--quiet"], check=False)
-            if staged.returncode == 0:
-                raise GitHubError("没有可提交的已审批变更")
+            _git(repo, ["read-tree", patch.tree])
             _git(repo, ["commit", "-m", request["commit_message"]])
         elif current_branch != head_branch:
             raise GitHubError("任务 worktree 已位于其他提交或分支，拒绝发布")
 
-        if hashlib.sha256(_diff(repo, base_commit).encode("utf-8")).hexdigest() != expected_diff_sha256:
+        head_commit = _git(repo, ["rev-parse", "HEAD"]).stdout.strip()
+        if (_git(repo, ["rev-parse", f"{head_commit}^"]).stdout.strip() != base_commit
+                or _git(repo, ["rev-parse", f"{head_commit}^{{tree}}"]).stdout.strip() != patch.tree
+                or hashlib.sha256(committed_diff(repo, base_commit, head_commit).encode("utf-8")).hexdigest()
+                != expected_diff_sha256):
             raise GitHubError("commit 后 diff 与审批对象不一致")
 
-        _git(repo, ["push", "--set-upstream", remote, f"HEAD:refs/heads/{head_branch}"])
         owner = repository.split("/", 1)[0]
         existing = self.api.find_open_pull(repository, owner, head_branch)
         if existing:
             if existing.get("draft") is not True:
                 raise GitHubError("相同分支已有非 Draft PR，拒绝复用")
             existing_base = (existing.get("base") or {}).get("ref")
-            if existing_base and existing_base != base_branch:
+            if existing_base != base_branch:
                 raise GitHubError("相同分支的 Draft PR 指向不同 base branch")
-            if existing.get("title") not in {None, request["title"]}:
+            if existing.get("title") != request["title"]:
                 raise GitHubError("已有 Draft PR 的标题与审批对象不一致")
-            if existing.get("body") not in {None, request["body"]}:
+            if existing.get("body") != request["body"]:
                 raise GitHubError("已有 Draft PR 的正文与审批对象不一致")
+            if (existing.get("head") or {}).get("sha") != head_commit:
+                raise GitHubError("已有 Draft PR 的提交与已审批提交不一致")
             result = {
                 "number": int(existing["number"]),
                 "html_url": str(existing["html_url"]),
@@ -209,11 +226,14 @@ class GitHubDraftPRPublisher:
                 "reused": True,
             }
         else:
+            _git(repo, ["push", push_urls[0], f"{head_commit}:refs/heads/{head_branch}"])
             result = self.api.create_draft_pr(
                 repository, title=request["title"], body=request["body"],
                 head=head_branch, base=base_branch,
             )
+            if result.get("commit") != head_commit:
+                raise GitHubError("新建 Draft PR 的提交与已审批提交不一致")
             result["reused"] = False
-        result["commit"] = _git(repo, ["rev-parse", "HEAD"]).stdout.strip()
+        result["commit"] = head_commit
         result["repository"] = repository
         return result

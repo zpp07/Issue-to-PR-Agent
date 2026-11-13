@@ -136,7 +136,7 @@ def test_optional_fastapi_routes_use_the_same_public_views(tmpdir, monkeypatch):
 
     store, task_id, diff, review = _store_with_artifacts(tmpdir)
     monkeypatch.setattr(service_api, "store", store)
-    with TestClient(service_api.app) as client:
+    with TestClient(service_api.app, base_url="http://127.0.0.1:8000") as client:
         tasks = client.get("/tasks?limit=1").json()
         assert tasks["tasks"][0]["id"] == task_id
         listed = client.get(f"/tasks/{task_id}/artifacts").json()

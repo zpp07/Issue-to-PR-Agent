@@ -10,6 +10,7 @@ import argparse
 import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -22,9 +23,11 @@ if sys.version_info < (3, 10):
 
 from core.audit import TaskStore
 from core.client import make_client
+from core.discovery import clone_public_repository, recommend_issues, repository_name, scan_pytest
 from core.execution import ExecutionManager
 from core.fake_publisher import FakeDraftPRPublisher
-from core.github import GitHubAPI, GitHubDraftPRPublisher
+from core.github import GitHubAPI, GitHubDraftPRPublisher, GitHubError
+from core.http_boundary import body_length, local_request_error
 from core.read_views import artifact_content, artifact_list, task_page
 from core.sandbox import DockerSandbox
 from core.startup import print_startup_checks, startup_checks
@@ -47,10 +50,13 @@ store = TaskStore(DATA_DIR / "agent_tasks.sqlite3")
 workflow = IssueToPRWorkflow(store, DATA_DIR / "workspaces")
 
 
+def runner():
+    return DockerSandbox(image=os.environ.get("AGENT_SANDBOX_IMAGE", "issue-to-pr-runner:phase3"))
+
+
 def service():
-    sandbox = DockerSandbox(image=os.environ.get("AGENT_SANDBOX_IMAGE", "issue-to-pr-runner:phase3"))
     return IssueToPRService(
-        workflow, make_client(), sandbox=sandbox,
+        workflow, make_client(), sandbox=runner(),
     )
 
 
@@ -58,18 +64,15 @@ execution_manager = ExecutionManager(store, service)
 
 
 def _publish_request_error(headers, port: int = 8765) -> str | None:
-    """Reject browser cross-origin/form requests before any external writes."""
-    host = headers.get("Host", "").lower()
-    if host not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
-        return "真实发布只接受本地工作台 Host"
-    origin = headers.get("Origin")
-    if origin is not None and origin != f"http://{host}":
-        return "真实发布拒绝跨来源请求"
-    if headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
-        return "真实发布拒绝跨站点请求"
-    if headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-        return "真实发布只接受 application/json"
-    return None
+    return local_request_error(headers, port, write=True)
+
+
+def _request_error(handler, *, write=False):
+    headers = getattr(handler, "headers", None)
+    if headers is None:  # Unit-test handler doubles do not parse real requests.
+        return None
+    port = getattr(getattr(handler, "server", None), "server_address", ("127.0.0.1", 8765))[1]
+    return local_request_error(headers, port, write=write)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -91,8 +94,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def _body(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(length) or b"{}")
+        length = body_length(self.headers)
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError("请求体不完整")
+        data = json.loads(raw or b"{}")
+        if not isinstance(data, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        return data
 
     def _reply(self, status, payload):
         content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -104,6 +113,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if error := _request_error(self):
+                return self._reply(403, {"detail": error})
             parsed = urlsplit(self.path)
             parts = parsed.path.strip("/").split("/")
             if parsed.path in STATIC_FILES:
@@ -137,17 +148,51 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, {"detail": str(exc)})
         except ValueError as exc:
             self._reply(400, {"detail": str(exc)})
+        except Exception:
+            logging.exception("Local HTTP GET failed")
+            self._reply(500, {"detail": "内部服务错误"})
 
     def do_POST(self):
         try:
-            body, parts = self._body(), self.path.strip("/").split("/")
+            if error := _request_error(self, write=True):
+                return self._reply(403, {"detail": error})
+            try:
+                body = self._body()
+            except OverflowError as exc:
+                return self._reply(413, {"detail": str(exc)})
+            except ValueError as exc:
+                return self._reply(400, {"detail": str(exc)})
+            parts = urlsplit(self.path).path.strip("/").split("/")
             if parts == ["tasks"]:
                 context, plan, plan_hash = service().create_and_plan(body["repo_path"], body["issue"])
                 return self._reply(201, {"task_id": context.task_id, "workspace": str(context.workspace),
                                          "plan": plan, "plan_sha256": plan_hash})
+            if parts == ["discovery", "github"]:
+                repository = repository_name(body["repository"])
+                return self._reply(200, {"repository": repository,
+                                         "issues": recommend_issues(GitHubAPI.from_env(), repository)})
+            if parts == ["discovery", "scan"]:
+                return self._reply(200, scan_pytest(Path(body["repo_path"]), runner()))
+            if parts == ["tasks", "scan"]:
+                repo = Path(body["repo_path"])
+                scanned = scan_pytest(repo, runner())
+                selected = body["failure"]
+                if scanned["base_commit"] != body["base_commit"] or selected not in scanned["failures"]:
+                    return self._reply(409, {"detail": "该失败已无法在同一基线上复现，请重新扫描"})
+                agent = service()
+                context = workflow.create_task(repo, (
+                    f"修复在基线 {scanned['base_commit']} 上两次复现的 pytest 失败：{selected}\n"
+                    "请定位实现错误，保留现有测试断言，并验证补丁。若证据不足，在计划中说明。"
+                ))
+                if context.base_commit != scanned["base_commit"]:
+                    return self._reply(409, {"detail": "创建时基线发生变化，请重新扫描"})
+                plan, plan_hash = agent.plan_existing(context.task_id)
+                return self._reply(201, {"task_id": context.task_id, "plan": plan, "plan_sha256": plan_hash})
             if parts == ["tasks", "github"]:
+                repository = repository_name(body["repository"])
+                repo_path = body.get("repo_path") or clone_public_repository(repository, DATA_DIR / "clones")
                 context, plan, plan_hash, issue = service().create_from_github_issue(
-                    body["repo_path"], body["repository"], body["issue_number"], GitHubAPI.from_env(),
+                    repo_path, repository, body["issue_number"], GitHubAPI.from_env(),
                 )
                 return self._reply(201, {
                     "task_id": context.task_id, "workspace": str(context.workspace),
@@ -209,10 +254,13 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, {"detail": "not found"})
         except PlanningUnavailable as exc:
             self._reply(503, {"detail": str(exc), "retryable": True})
+        except GitHubError as exc:
+            self._reply(502, {"detail": str(exc)})
         except (KeyError, ValueError, RuntimeError, FileExistsError) as exc:
             self._reply(409, {"detail": str(exc)})
-        except Exception as exc:
-            self._reply(400, {"detail": str(exc)})
+        except Exception:
+            logging.exception("Local HTTP POST failed")
+            self._reply(500, {"detail": "内部服务错误"})
 
     def log_message(self, format, *args):
         return  # audit data is in SQLite; do not add noisy stdout request logs.

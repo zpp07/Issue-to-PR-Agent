@@ -171,10 +171,13 @@ def chunk_repository(root: str | Path, max_file_bytes: int = 300_000) -> list[Co
         if any(part in IGNORED_DIRS for part in relative.parts):
             continue
         try:
-            if path.stat().st_size > max_file_bytes:
+            resolved = path.resolve()
+            if root not in resolved.parents:
                 continue
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            if resolved.stat().st_size > max_file_bytes:
+                continue
+            text = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, RuntimeError):
             continue
         relative_text = relative.as_posix()
         chunks.extend(_python_chunks(relative_text, text) if path.suffix.lower() == ".py"
@@ -302,14 +305,23 @@ class HybridCodeSearch:
     def __init__(self, root: str | Path, encoder: DenseEncoder | None = None,
                  reranker: Reranker | None = None):
         self.root = Path(root).resolve()
+        self.encoder = encoder or HashingDenseEncoder()
+        self.reranker = reranker or LexicalReranker()
+        self._refresh()
+
+    def invalidate(self):
+        self._dirty = True
+
+    def _refresh(self):
         self.chunks = chunk_repository(self.root)
         self.documents = [f"{chunk.path} {chunk.symbol}\n{chunk.text}" for chunk in self.chunks]
         self.bm25 = BM25Index(self.documents)
-        self.encoder = encoder or HashingDenseEncoder()
-        self.reranker = reranker or LexicalReranker()
         self.vectors = self.encoder.encode(self.documents)
+        self._dirty = False
 
     def search(self, query: str, top_k: int = 5, candidate_k: int = 20) -> list[SearchHit]:
+        if self._dirty:
+            self._refresh()
         if not query.strip() or not self.chunks:
             return []
         top_k = max(1, min(int(top_k), 10))
@@ -325,6 +337,8 @@ class HybridCodeSearch:
         normalized_rerank = _normalize(rerank_values)
         hits = []
         for position, index in enumerate(candidates):
+            if self.root not in (self.root / self.chunks[index].path).resolve().parents:
+                continue
             final = 0.45 * hybrid[index] + 0.55 * normalized_rerank[position]
             hits.append(SearchHit(self.chunks[index], final, bm25[index], dense[index], rerank_values[position]))
         return sorted(hits, key=lambda hit: hit.score, reverse=True)[:top_k]

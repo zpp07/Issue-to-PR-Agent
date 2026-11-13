@@ -86,6 +86,25 @@ def _llm_call(client, messages, tools, model):
     return resp.choices[0].message, used, request_id, provider_request_id
 
 
+def _valid_tool_value(value, schema):
+    kind = schema.get("type")
+    if kind == "object":
+        fields = schema.get("properties", {})
+        return (isinstance(value, dict) and all(key in value for key in schema.get("required", ()))
+                and all(key in fields and _valid_tool_value(item, fields[key])
+                        for key, item in value.items()))
+    if kind == "array":
+        return isinstance(value, list) and all(_valid_tool_value(item, schema["items"]) for item in value)
+    if kind == "integer":
+        return (type(value) is int and schema.get("minimum", value) <= value
+                <= schema.get("maximum", value))
+    if kind == "boolean":
+        return type(value) is bool
+    if kind == "string":
+        return isinstance(value, str) and ("enum" not in schema or value in schema["enum"])
+    return False
+
+
 def run_agent(
     client,
     system_prompt,
@@ -106,6 +125,8 @@ def run_agent(
     final_step_tool_names=None,
     terminal_tool_reserve=1,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    on_usage: Callable[[int, int], None] | None = None,
+    allow_omitted_positive_review_issues: bool = False,
 ):
     """
     通用 agent 循环。
@@ -190,6 +211,12 @@ def run_agent(
     update_patch_state()
 
     for step in range(max_steps):
+        if max_tokens is not None and usage.total_tokens >= max_tokens:
+            set_exit("max_tokens")
+            return {"result": "任务 token 预算已用尽"}, usage
+        if max_cost_rmb is not None and usage.cost_rmb() >= max_cost_rmb:
+            set_exit("max_cost")
+            return {"result": "任务成本预算已用尽"}, usage
         if (no_progress_after is not None and not successful_mutation
                 and intervention is None and step >= no_progress_after):
             prompt = no_progress_prompt or (
@@ -242,6 +269,8 @@ def run_agent(
             set_exit("llm_error")
             return {"result": f"LLM 调用失败：{exc}", "retryable": exc.retryable}, usage
         usage.add(pt, ct)
+        if on_usage is not None:
+            on_usage(pt, ct)
         update_budget_state(step)
 
         # 预算上限检查：token / 成本
@@ -278,8 +307,8 @@ def run_agent(
             name = tool_call.function.name
             try:
                 args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError as e:
-                args = {"result": f"参数解析失败：{e}"}
+            except (TypeError, json.JSONDecodeError):
+                args = None
             if trace is not None or on_event is not None:
                 trace_record = {"step": step, "action": name, "args": args,
                                 "request_id": request_id,
@@ -291,8 +320,16 @@ def run_agent(
 
             rejected_by_intervention = False
             rejected_as_unavailable = name not in visible_tool_names
+            schema = next((tool["function"]["parameters"] for tool in visible_tools
+                           if tool["function"]["name"] == name), None)
+            if (allow_omitted_positive_review_issues and name == "review_finish"
+                    and isinstance(args, dict) and args.get("passed") is True and "issues" not in args):
+                args = {**args, "issues": []}
+            invalid_args = schema is not None and not _valid_tool_value(args, schema)
             if rejected_as_unavailable:
                 result = f"拒绝操作：工具 {name} 当前阶段未暴露"
+            elif invalid_args:
+                result = "拒绝操作：工具参数不符合已注册 schema"
             elif intervention is not None and name != "progress_decision":
                 allowed = {
                     "minimal_edit": {"replace_text", "write_file"},
@@ -416,7 +453,9 @@ def run_agent(
                 on_event(dict(trace_record))
 
             # 终态工具：finish / review_finish / plan_finish —— 立即返回结构化结果
-            if name in ("finish", "review_finish", "plan_finish") and not rejected_as_unavailable:
+            if (name in ("finish", "review_finish", "plan_finish")
+                    and not (rejected_as_unavailable or rejected_by_intervention)
+                    and (not invalid_args or name == "plan_finish")):
                 final = args.get("result") if name == "finish" else args
                 # finish 的 result 直接是字符串；若是 dict 也原样返回
                 set_exit("finish")

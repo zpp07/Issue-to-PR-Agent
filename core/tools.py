@@ -402,10 +402,17 @@ def make_executor(workdir, policy=None, approval_callback=None, command_runner=N
         p = resolve(p).resolve(strict=False)
         try:
             common = os.path.commonpath([str(p), str(workdir)])
-            inside = os.path.normcase(common) == os.path.normcase(str(workdir))
+            inside = (os.path.normcase(common) == os.path.normcase(str(workdir))
+                      and p != workdir
+                      and all(part.rstrip(" .").lower() != ".git" and ":" not in part
+                              for part in p.relative_to(workdir).parts))
         except ValueError:
             inside = False  # 跨盘符等情况
         return str(p), inside
+
+    def invalidate_search():
+        if hasattr(code_search, "invalidate"):
+            code_search.invalidate()
 
     allowed_writes = None
     if writable_files is not None:
@@ -425,12 +432,12 @@ def make_executor(workdir, policy=None, approval_callback=None, command_runner=N
         elif name == "read_file":
             p, inside = check_inside(args["path"])
             if not inside:
-                return f"拒绝读取：路径 {p} 在工作区之外"
+                return ToolResult(f"拒绝读取：路径 {p} 在工作区之外", "rejected")
             return read_file(p, args.get("start_line"), args.get("end_line"))
         elif name == "read_symbol":
             p, inside = check_inside(args["path"])
             if not inside:
-                return f"拒绝读取：路径 {p} 在工作区之外"
+                return ToolResult(f"拒绝读取：路径 {p} 在工作区之外", "rejected")
             from core.symbols import read_symbol_source
             payload = read_symbol_source(
                 p, args["symbol"], args.get("occurrence"),
@@ -443,24 +450,28 @@ def make_executor(workdir, policy=None, approval_callback=None, command_runner=N
         elif name == "write_file":
             p, inside = check_inside(args["path"])
             if not inside:
-                return f"拒绝写入：路径 {p} 在工作区之外"
+                return ToolResult(f"拒绝写入：路径 {p} 在工作区之外", "rejected")
             if allowed_writes is not None and os.path.normcase(p) not in allowed_writes:
-                return f"拒绝写入：路径 {p} 不在本任务的写入 allowlist"
+                return ToolResult(f"拒绝写入：路径 {p} 不在本任务的写入 allowlist", "rejected")
             before = Path(p).read_bytes() if Path(p).is_file() else None
             content = write_file(p, args["content"])
             status = "error" if content.startswith("写入失败") else "ok"
             after = Path(p).read_bytes() if status == "ok" and Path(p).is_file() else before
+            if before != after:
+                invalidate_search()
             return ToolResult(content, status, {"mutation_applied": status == "ok" and before != after})
         elif name == "replace_text":
             p, inside = check_inside(args["path"])
             if not inside:
-                return f"拒绝写入：路径 {p} 在工作区之外"
+                return ToolResult(f"拒绝写入：路径 {p} 在工作区之外", "rejected")
             if allowed_writes is not None and os.path.normcase(p) not in allowed_writes:
-                return f"拒绝写入：路径 {p} 不在本任务的写入 allowlist"
+                return ToolResult(f"拒绝写入：路径 {p} 不在本任务的写入 allowlist", "rejected")
             before = Path(p).read_bytes() if Path(p).is_file() else None
             content = replace_text(p, args["old"], args["new"])
             status = "rejected" if content.startswith("替换失败") else "ok"
             after = Path(p).read_bytes() if status == "ok" and Path(p).is_file() else before
+            if before != after:
+                invalidate_search()
             return ToolResult(content, status, {"mutation_applied": status == "ok" and before != after})
         elif name == "run_command":
             argv = args.get("argv")
@@ -469,12 +480,18 @@ def make_executor(workdir, policy=None, approval_callback=None, command_runner=N
                 if decision.requires_approval:
                     if approval_callback is not None and approval_callback(argv, decision):
                         runner = command_runner or run_command
-                        return runner(argv, cwd=str(workdir))
-                    return f"命令需要人工审批：{decision.reason}；argv={argv!r}"
+                        try:
+                            return runner(argv, cwd=str(workdir))
+                        finally:
+                            invalidate_search()
+                    return ToolResult(f"命令需要人工审批：{decision.reason}；argv={argv!r}", "rejected")
                 if not decision.allowed:
-                    return f"命令被策略拒绝：{decision.reason}；argv={argv!r}"
+                    return ToolResult(f"命令被策略拒绝：{decision.reason}；argv={argv!r}", "rejected")
             runner = command_runner or run_command
-            return runner(argv, cwd=str(workdir))
+            try:
+                return runner(argv, cwd=str(workdir))
+            finally:
+                invalidate_search()
         elif name == "finish":
             return args["result"]
         elif name == "review_finish":

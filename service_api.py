@@ -13,6 +13,7 @@ from core.audit import TaskStore
 from core.client import make_client
 from core.execution import ExecutionManager
 from core.github import GitHubAPI, GitHubDraftPRPublisher, GitHubError
+from core.http_boundary import body_length, local_request_error
 from core.read_views import artifact_content, artifact_list, task_page
 from core.sandbox import DockerSandbox
 from core.workflow import IssueToPRWorkflow
@@ -20,7 +21,8 @@ from core.workflow import IssueToPRWorkflow
 from issue_to_pr import IssueToPRService, PlanningUnavailable
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import JSONResponse
     from pydantic import BaseModel
 except ImportError as exc:  # makes core/test use possible without web extras
     raise RuntimeError("请先安装 web 依赖：pip install -e '.[web]' ") from exc
@@ -74,9 +76,26 @@ class DraftPRRequest(BaseModel):
 
 class PublishRequest(BaseModel):
     subject_hash: str
+    confirmation: str | None = None
 
 
 app = FastAPI(title="Local Issue-to-PR Agent", version="0.6.0")
+
+
+@app.middleware("http")
+async def local_boundary(request: Request, call_next):
+    write = request.method in {"POST", "PUT", "PATCH", "DELETE"}
+    port = request.scope["server"][1] or 80
+    if error := local_request_error(request.headers, port, write=write):
+        return JSONResponse(status_code=403, content={"detail": error})
+    if write:
+        try:
+            body_length(request.headers)
+        except OverflowError as exc:
+            return JSONResponse(status_code=413, content={"detail": str(exc)})
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+    return await call_next(request)
 
 
 def service() -> IssueToPRService:
@@ -103,7 +122,9 @@ def create_task(request: CreateTask):
     try:
         context, plan, plan_hash = service().create_and_plan(request.repo_path, request.issue)
         return {"task_id": context.task_id, "workspace": str(context.workspace), "plan": plan, "plan_sha256": plan_hash}
-    except Exception as exc:
+    except PlanningUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (ValueError, FileExistsError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -117,7 +138,11 @@ def create_github_task(request: CreateGitHubTask):
             "task_id": context.task_id, "workspace": str(context.workspace),
             "plan": plan, "plan_sha256": plan_hash, "github_issue": issue,
         }
-    except Exception as exc:
+    except PlanningUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GitHubError as exc:
+        raise HTTPException(status_code=502, detail="GitHub Issue 读取失败") from exc
+    except (ValueError, FileExistsError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -179,6 +204,10 @@ def approve_publish(task_id: str, request: ApprovalRequest):
 
 @app.post("/tasks/{task_id}/draft-pr/publish")
 def publish_draft_pr(task_id: str, request: PublishRequest):
+    if os.environ.get("AGENT_REAL_PUBLISHER") != "1":
+        raise HTTPException(status_code=403, detail="真实发布未启用")
+    if request.confirmation != "create-draft-pr":
+        raise HTTPException(status_code=409, detail="缺少真实发布二次确认")
     try:
         return workflow.publish_draft_pr(
             task_id, request.subject_hash, GitHubDraftPRPublisher(github()),

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import uuid
 from typing import Sequence
 
 from core.tools import COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT, ToolResult
@@ -26,6 +27,7 @@ class SandboxResult:
     exit_code: int
     output: str
     timed_out: bool = False
+    image_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,10 +83,13 @@ class DockerSandbox:
                 "未找到 docker。Phase 3 禁止把不可信代码静默回退到宿主机；"
                 "请安装并启动 Docker Desktop 后重试。"
             )
-        probe = subprocess.run(
-            [self.docker_binary, "version", "--format", "{{.Server.Version}}"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
-        )
+        try:
+            probe = subprocess.run(
+                [self.docker_binary, "version", "--format", "{{.Server.Version}}"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DockerUnavailable("无法连接 Docker daemon") from exc
         if probe.returncode != 0:
             raise DockerUnavailable(
                 "docker 命令存在，但 daemon 不可用：" + (probe.stderr or probe.stdout).strip()[:300]
@@ -92,7 +97,9 @@ class DockerSandbox:
 
     def container_argv(self, workspace: str | Path, command: Sequence[str], *,
                        workdir: str | Path | None = None, read_only_workspace: bool = False,
-                       hidden_tests: str | Path | None = None) -> list[str]:
+                       hidden_tests: str | Path | None = None,
+                       name: str | None = None,
+                       image_id: str | None = None) -> list[str]:
         workspace = Path(workspace).resolve()
         current = Path(workdir).resolve() if workdir else workspace
         if current != workspace and workspace not in current.parents:
@@ -112,19 +119,31 @@ class DockerSandbox:
             "--mount", workspace_mount,
             "--workdir", container_workdir,
         ]
+        if name:
+            argv.extend(["--name", name])
         if hidden_tests is not None:
             hidden = Path(hidden_tests).resolve()
             argv.extend(["--mount", f"type=bind,src={hidden},dst=/hidden,readonly"])
-        argv.extend([self.image, *command])
+        argv.extend([image_id or self.image, *command])
         return argv
 
     def run(self, workspace: str | Path, command: Sequence[str], *,
             workdir: str | Path | None = None, read_only_workspace: bool = False,
             hidden_tests: str | Path | None = None, timeout: int | None = None) -> SandboxResult:
         self.require_available()
+        try:
+            inspected = subprocess.run(
+                [self.docker_binary, "image", "inspect", "--format", "{{.Id}}", self.image],
+                capture_output=True, text=True, timeout=10, check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise DockerUnavailable(f"无法检查本地 runner 镜像：{self.image}") from exc
+        image_id = inspected.stdout.strip()
+        name = f"issue-to-pr-{uuid.uuid4().hex}"
         argv = self.container_argv(
             workspace, command, workdir=workdir,
             read_only_workspace=read_only_workspace, hidden_tests=hidden_tests,
+            name=name, image_id=image_id,
         )
         effective_timeout = timeout or self.limits.timeout
         try:
@@ -134,17 +153,26 @@ class DockerSandbox:
             )
             output = (proc.stdout + proc.stderr) or "(无输出)"
             if len(output) > MAX_COMMAND_OUTPUT:
-                output = output[:MAX_COMMAND_OUTPUT] + f"\n...[已截断，共 {len(output)} 字符]"
-            return SandboxResult(proc.returncode, output)
+                half = MAX_COMMAND_OUTPUT // 2
+                output = output[:half] + f"\n...[已截断，共 {len(output)} 字符]\n" + output[-half:]
+            return SandboxResult(proc.returncode, output, image_id=image_id)
         except subprocess.TimeoutExpired as exc:
-            partial = ((exc.stdout or "") + (exc.stderr or "")) if isinstance(exc.stdout, str) else ""
-            return SandboxResult(124, partial + f"\n容器命令超时（>{effective_timeout}s）", True)
+            try:
+                cleanup = subprocess.run(
+                    [self.docker_binary, "rm", "-f", name], capture_output=True, timeout=10,
+                )
+                removed = cleanup.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                removed = False
+            output = f"容器命令超时（>{effective_timeout}s）；容器={name}；清理确认={removed}"
+            return SandboxResult(124, output, True, image_id)
 
-    def command_runner(self, workspace: str | Path):
+    def command_runner(self, workspace: str | Path, *, read_only_workspace: bool = True):
         workspace = Path(workspace).resolve()
 
         def runner(argv, cwd=None, timeout=COMMAND_TIMEOUT):
-            result = self.run(workspace, argv, workdir=cwd or workspace, timeout=timeout)
+            result = self.run(workspace, argv, workdir=cwd or workspace, timeout=timeout,
+                              read_only_workspace=read_only_workspace)
             return ToolResult(
                 result.output,
                 "error" if result.timed_out else "ok",
